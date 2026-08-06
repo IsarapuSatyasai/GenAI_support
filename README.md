@@ -16,17 +16,17 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from typing import Optional
 import json
+import os
 ```
 
 **Explanation:**  
-Imports everything we need. We keep the imports minimal and clean.
+Imports everything we need. Added `os` so we can set environment variables cleanly.
 
 ---
 
 ### Cell 3: Define Pydantic Models (Schema)
 
 ```python
-
 class MetricValue(BaseModel):
     value: Optional[float] = Field(None, description="Extracted numeric value")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1")
@@ -97,24 +97,42 @@ You can later replace this with real files.
 
 ---
 
-### Cell 6: Initialize LLM Client
+### Cell 6: Initialize LLM Client (Databricks Secrets)
 
 ```python
-# client = OpenAI(
-#     api_key = "",
-#     base_url = ""
-# )
+# Load secrets and configuration from Databricks (as shared by Saumya)
+os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(
+    scope="azure-key-vault-scope", 
+    key="openai-apim-api-key"
+)
+os.environ["AZURE_OAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
+os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
+os.environ["SA_ACCESSKEY"] = dbutils.secrets.get(
+    scope="azure-key-vault-scope", 
+    key="sta-eu-accesskey"
+)
+os.environ["ENVIRONMENT"] = "prd"
+
+# Initialize OpenAI client for Azure APIM endpoint
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.environ["AZURE_OAI_ENDPOINT"]
+)
+
+print("OpenAI client initialized successfully")
 ```
 
 **Explanation:**  
-Never hardcode keys in production. Use Databricks secrets when moving to real environment.
+- Uses the exact secret scope and keys provided by Saumya.  
+- Sets the Azure APIM endpoint as `base_url`.  
+- Never hardcodes secrets.  
+- Storage account key is also loaded in case you need it later for file access.
 
 ---
 
 ### Cell 7: Metric Extraction Function (with Confidence)
 
 ```python
-
 def extract_metrics_with_confidence(data: str, model: str = "gpt-4o-mini") -> ExtractedMetrics:
 
     system_prompt = """
