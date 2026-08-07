@@ -1,30 +1,18 @@
-### Cell 1: Install Required Libraries
 
 ```python
-%pip install openai pydantic --quiet
+%pip install openai pydantic pandas openpyxl --quiet
+%restart_python
 ```
 
-**Explanation:**  
-Installs the necessary packages. `pydantic` is required for strict schema validation. `--quiet` keeps the output clean.
-
----
-
-### Cell 2: Import Libraries
-
 ```python
-from openai import OpenAI
+from openai import AzureOpenAI
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict
+import pandas as pd
+from datetime import datetime
 import json
 import os
 ```
-
-**Explanation:**  
-Imports everything we need. Added `os` so we can set environment variables cleanly.
-
----
-
-### Cell 3: Define Pydantic Models (Schema)
 
 ```python
 class MetricValue(BaseModel):
@@ -43,18 +31,8 @@ class ExtractedMetrics(BaseModel):
     bookings: Optional[MetricValue] = None
 ```
 
-**Explanation:**  
-This is the core schema Soumya requested.  
-Every numeric metric now returns both `value` and `confidence`.  
-Pydantic will validate the structure automatically.
-
----
-
-### Cell 4: Generic Data Loading Function
-
 ```python
 def load_data(source: str, source_type: str = "text") -> str:
-
     if source_type in ["text", "xml"]:
         return source.strip()
     elif source_type == "file":
@@ -64,76 +42,30 @@ def load_data(source: str, source_type: str = "text") -> str:
         raise ValueError(f"Unsupported source_type: {source_type}")
 ```
 
-**Explanation:**  
-This is the temporary generic loader we agreed on.  
-Once Soumya finishes her Excel/document loading part, we can easily replace the inside of this function.
-
----
-
-### Cell 5: Sample Data (for testing)
-
 ```python
-sample_xml = """
-<report>
-    <company>ASML</company>
-    <period>Q2 2025</period>
-    <revenue currency="EUR">7.1</revenue>
-    <net_sales>6.9</net_sales>
-    <gross_margin>51.2</gross_margin>
-    <operating_income>2.15</operating_income>
-    <net_income>1.85</net_income>
-    <orders>8.4</orders>
-    <bookings>9.1</bookings>
-</report>
-"""
-
-raw_data = load_data(sample_xml, source_type="xml")
-print("Data loaded successfully. Length:", len(raw_data))
-```
-
-**Explanation:**  
-Using a realistic sample so you can test immediately.  
-You can later replace this with real files.
-
----
-
-### Cell 6: Initialize LLM Client (Databricks Secrets)
-
-```python
-# Load secrets and configuration from Databricks (as shared by Saumya)
 os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope", 
+    scope="azure-key-vault-scope",
     key="openai-apim-api-key"
 )
 os.environ["AZURE_OAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
 os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
 os.environ["SA_ACCESSKEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope", 
+    scope="azure-key-vault-scope",
     key="sta-eu-accesskey"
 )
 os.environ["ENVIRONMENT"] = "prd"
 
-# Initialize OpenAI client for Azure APIM endpoint
-client = OpenAI(
+client = AzureOpenAI(
     api_key=os.environ["OPENAI_API_KEY"],
-    base_url=os.environ["AZURE_OAI_ENDPOINT"]
+    api_version="2024-08-01-preview",
+    azure_endpoint=os.environ["AZURE_OAI_ENDPOINT"]
 )
 
-print("OpenAI client initialized successfully")
+print("Azure OpenAI client initialized successfully")
 ```
 
-**Explanation:**  
-- Uses the exact secret scope and keys provided by Saumya.  
-- Sets the Azure APIM endpoint as `base_url`.  
-- Never hardcodes secrets.  
-- Storage account key is also loaded in case you need it later for file access.
-
----
-
-### Cell 7: Metric Extraction Function (with Confidence)
-
 ```python
-def extract_metrics_with_confidence(data: str, model: str = "gpt-4o-mini") -> ExtractedMetrics:
+def extract_metrics_with_confidence(data: str, model: str = "gpt-4o") -> ExtractedMetrics:
 
     system_prompt = """
     You are a precise financial data extraction assistant.
@@ -177,52 +109,145 @@ def extract_metrics_with_confidence(data: str, model: str = "gpt-4o-mini") -> Ex
 
     raw_json = response.choices[0].message.content
     parsed = json.loads(raw_json)
-
-    # Validate against Pydantic model
     return ExtractedMetrics(**parsed)
 ```
 
-**Explanation:**  
-- Uses `temperature=0.0` for consistency  
-- Forces JSON output  
-- Validates the response with Pydantic  
-- Returns both value + confidence for every metric
+```python
+def validate_metrics(extracted: ExtractedMetrics, threshold: float = 0.7) -> Dict:
+    """
+    Checks confidence scores.
+    Returns a dictionary with:
+    - valid_metrics
+    - low_confidence_metrics (for review / re-extraction)
+    """
+    metric_fields = [
+        "revenue", "net_sales", "gross_margin",
+        "operating_income", "net_income", "orders", "bookings"
+    ]
 
----
+    valid = []
+    low_confidence = []
 
-### Cell 8: Run the Extraction
+    for field in metric_fields:
+        metric = getattr(extracted, field)
+        if metric is None or metric.value is None:
+            continue
+
+        item = {
+            "Variable": field.replace("_", " ").title(),
+            "Value": metric.value,
+            "Score": metric.confidence
+        }
+
+        if metric.confidence >= threshold:
+            valid.append(item)
+        else:
+            low_confidence.append(item)
+
+    return {
+        "valid_metrics": valid,
+        "low_confidence_metrics": low_confidence,
+        "company": extracted.company,
+        "period": extracted.period
+    }
+```
 
 ```python
-print("Extracting metrics with confidence scores...\n")
-
-result = extract_metrics_with_confidence(raw_data)
-
-print(result.model_dump_json(indent=2))
+def excel_write(sheet_configs, output_filename=None, prefix="financial_report"):
+    
+    if output_filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"{prefix}_{timestamp}.xlsx"
+    
+    output_path = f"/Workspace/Users/greeshmitham@delagelanden.com/financial_excel_sheet_func/{output_filename}"
+    
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        for config in sheet_configs:
+            sheet_name = config["sheet_name"]
+            data = config.get("data", [])
+            
+            df = pd.DataFrame(data)
+            
+            if 'No' not in df.columns:
+                df.insert(0, 'No', range(1, len(df) + 1))
+            
+            columns = ['No', 'Variable', 'Value', 'Score']
+            for col in columns:
+                if col not in df.columns:
+                    df[col] = None
+            df = df[columns]
+            
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            worksheet = writer.sheets[sheet_name]
+            for idx, col in enumerate(df.columns):
+                worksheet.column_dimensions[chr(65 + idx)].width = 18
+            
+            for cell in worksheet[1]:
+                cell.font = cell.font.copy(bold=True)
+    
+    print(f"Excel file created: {output_path}")
+    return output_path
 ```
 
-**Explanation:**  
-This cell runs the full flow and prints the structured output.
+```python
+# 1. Sample data
+sample_xml = """
+<report>
+    <company>ASML</company>
+    <period>Q2 2025</period>
+    <revenue currency="EUR">7.1</revenue>
+    <net_sales>6.9</net_sales>
+    <gross_margin>51.2</gross_margin>
+    <operating_income>2.15</operating_income>
+    <net_income>1.85</net_income>
+    <orders>8.4</orders>
+    <bookings>9.1</bookings>
+</report>
+"""
+
+# 2. Load data
+raw_data = load_data(sample_xml, source_type="xml")
+print("Data loaded successfully.\n")
+
+# 3. Extract metrics using LLM
+print("Extracting metrics with confidence scores...")
+extracted = extract_metrics_with_confidence(raw_data, model="gpt-4o")
+print(extracted.model_dump_json(indent=2))
+print()
+
+# 4. Validate metrics
+validation_result = validate_metrics(extracted, threshold=0.7)
+
+print("=== Validation Summary ===")
+print(f"Company : {validation_result['company']}")
+print(f"Period  : {validation_result['period']}")
+print(f"Valid metrics          : {len(validation_result['valid_metrics'])}")
+print(f"Low confidence metrics : {len(validation_result['low_confidence_metrics'])}")
+
+if validation_result["low_confidence_metrics"]:
+    print("\nMetrics marked for review (confidence < 0.7):")
+    for item in validation_result["low_confidence_metrics"]:
+        print(f"  - {item['Variable']}: {item['Value']} (Score: {item['Score']})")
+
+# 5. Prepare data for Excel
+sheet_configs = [
+    {
+        "sheet_name": "Extracted Metrics",
+        "data": validation_result["valid_metrics"]
+    }
+]
+
+# Optionally add low confidence metrics in a separate sheet
+if validation_result["low_confidence_metrics"]:
+    sheet_configs.append({
+        "sheet_name": "Needs Review",
+        "data": validation_result["low_confidence_metrics"]
+    })
+
+# 6. Generate Excel
+excel_path = excel_write(sheet_configs)
+print(f"\nProcess completed. Excel saved at:\n{excel_path}")
+```
 
 ---
-
-### Expected Output Example:
-
-```json
-{
-  "company": "ASML",
-  "period": "Q2 2025",
-  "revenue": {
-    "value": 7.1,
-    "confidence": 0.95
-  },
-  "net_sales": {
-    "value": 6.9,
-    "confidence": 0.93
-  },
-  "gross_margin": {
-    "value": 51.2,
-    "confidence": 0.94
-  },
-  ...
-}
-```
