@@ -37,6 +37,7 @@ llm = AzureChatOpenAI(
     api_key=os.environ["OPENAI_API_KEY"],
     temperature=0.0
 )
+```
 
 ```python
 # ==========================================
