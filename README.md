@@ -221,5 +221,3 @@ if __name__ == "__main__":
     print(f"Report saved to: {final_state.get('excel_path')}")
 
 ```
-
-3. **Extensibility**: Want to add a node that emails the Excel file if low-confidence metrics are found? Or a node that hits a web search if `company` is `null`? In LangGraph, you just define a new node and add a conditional edge, rather than cluttering your main executio
