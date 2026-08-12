@@ -56,8 +56,11 @@ class ExtractedMetrics(BaseModel):
     orders: Optional[MetricValue] = None
     bookings: Optional[MetricValue] = None
 
-# Bind the Pydantic model to the LLM to force structured output
-structured_llm = llm.with_structured_output(ExtractedMetrics)
+# Bind the Pydantic model using function calling instead of json_schema
+structured_llm = llm.with_structured_output(
+    ExtractedMetrics, 
+    method="function_calling"
+)
 ```
 ```python
 # 3. Define Graph State
