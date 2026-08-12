@@ -38,6 +38,7 @@ llm = AzureChatOpenAI(
     temperature=0.0
 )
 
+```python
 # ==========================================
 # 2. Pydantic Schemas
 # ==========================================
@@ -58,7 +59,8 @@ class ExtractedMetrics(BaseModel):
 
 # Bind the Pydantic model to the LLM to force structured output
 structured_llm = llm.with_structured_output(ExtractedMetrics)
-
+```
+```python
 # 3. Define Graph State
 class GraphState(TypedDict):
     """Represents the state of our graph passing between nodes."""
@@ -69,7 +71,8 @@ class GraphState(TypedDict):
     company: Optional[str]
     period: Optional[str]
     excel_path: Optional[str]
-
+```
+```python
 # 4. Define Graph Nodes
 def extract_node(state: GraphState) -> GraphState:
     """Node 1: Extracts financial metrics using LLM."""
@@ -167,7 +170,8 @@ def generate_excel_node(state: GraphState) -> GraphState:
                 pd.DataFrame(columns=['No', 'Variable', 'Value', 'Score']).to_excel(writer, sheet_name=sheet_name, index=False)
                 
     return {"excel_path": output_path}
-
+```
+```python
 # ==========================================
 # 5. Build and Compile the Graph
 # ==========================================
@@ -186,7 +190,8 @@ workflow.add_edge("export", END)
 
 # Compile
 app = workflow.compile()
-
+```
+```python
 # ==========================================
 # 6. Execute the Graph
 # ==========================================
