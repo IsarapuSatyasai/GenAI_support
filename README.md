@@ -20,10 +20,10 @@ from pydantic import BaseModel, Field
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
+```
+```python
 
-# ==========================================
 # 1. Credentials & Setup
-# ==========================================
 os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(scope="azure-key-vault-scope", key="openai-apim-api-key")
 os.environ["AZURE_OAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
 os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
@@ -40,9 +40,7 @@ llm = AzureChatOpenAI(
 ```
 
 ```python
-# ==========================================
 # 2. Pydantic Schemas
-# ==========================================
 class MetricValue(BaseModel):
     value: Optional[float] = Field(None, description="Extracted numeric value")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1")
@@ -173,9 +171,7 @@ def generate_excel_node(state: GraphState) -> GraphState:
     return {"excel_path": output_path}
 ```
 ```python
-# ==========================================
 # 5. Build and Compile the Graph
-# ==========================================
 workflow = StateGraph(GraphState)
 
 # Add Nodes
@@ -193,9 +189,9 @@ workflow.add_edge("export", END)
 app = workflow.compile()
 ```
 ```python
-# ==========================================
+
 # 6. Execute the Graph
-# ==========================================
+
 if __name__ == "__main__":
     sample_xml = """
     <report>
@@ -226,8 +222,4 @@ if __name__ == "__main__":
 
 ```
 
-### Key Differences & Benefits
-
-1. **State Management (`GraphState`)**: Instead of passing arguments sequentially between loose functions, everything is stored in a single, typed dictionary. This makes debugging incredibly easy because you can inspect the exact `state` at any point in the graph.
-2. **`with_structured_output`**: Notice how the raw JSON parsing (`json.loads()`) is entirely gone from `extract_node`. LangChain handles injecting the Pydantic schema into the API call and natively deserializing the response, making it highly robust against formatting errors.
-3. **Extensibility**: Want to add a node that emails the Excel file if low-confidence metrics are found? Or a node that hits a web search if `company` is `null`? In LangGraph, you just define a new node and add a conditional edge, rather than cluttering your main execution block.
+3. **Extensibility**: Want to add a node that emails the Excel file if low-confidence metrics are found? Or a node that hits a web search if `company` is `null`? In LangGraph, you just define a new node and add a conditional edge, rather than cluttering your main executio
