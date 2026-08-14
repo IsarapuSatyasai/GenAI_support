@@ -273,12 +273,10 @@ if __name__ == "__main__":
             output_blob_path = f"{output_blob_folder}/{excel_filename}"
             
             upload_local_to_blob(local_excel_path, output_blob_path)
-```
             
             final_url = f"https://{os.environ['STORAGE_ACCOUNT']}.blob.core.windows.net/projects/{output_blob_path}"
             print(f"Output Successfully Uploaded To: {final_url}")
             
     except Exception as e:
         print(f"An error occurred: {str(e)}")
-
 ```
