@@ -171,7 +171,9 @@ def answer_questions(state: FinancialGraphState) -> ExtractionResponse:
 #                 answer=answer_text,
 #             )
 #         )
-#
+#  
+#     return ExtractionResponse(answers=answers, errors=errors)
+```
 ```
 ## GIT COMMIT MESSAGE
 ```python
@@ -184,7 +186,4 @@ refactor: transition financial data extraction to single bulk LLM call
 - Expanded the `ExtractedAnswer` Pydantic schema to include `confidence`, `page_number`, and `year` fields to support downstream validation and Excel hyperlink generation.
 - Updated the `SYSTEM_PROMPT` to instruct the LLM on handling missing data with explicit fallback values (e.g., confidence 0.0, page_number -1).
 - Commented out the legacy `answer_questions` function to preserve it for A/B testing and comparison per team lead request.
-```
-#     
-#     return ExtractionResponse(answers=answers, errors=errors)
 ```
