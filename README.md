@@ -174,7 +174,6 @@ def answer_questions(state: FinancialGraphState) -> ExtractionResponse:
 #  
 #     return ExtractionResponse(answers=answers, errors=errors)
 ```
-```
 ## GIT COMMIT MESSAGE
 ```python
 refactor: transition financial data extraction to single bulk LLM call
