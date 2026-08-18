@@ -1,282 +1,190 @@
 ```python
-%pip install langchain langchain-openai langgraph pydantic azure-storage-blob openpyxl pypdf
-dbutils.library.restartPython()
+"""Node: Answer Questions using LLM.
 
-```
+Iterates over each Excel row and extracts the corresponding financial
+data point from the PDF context in a single bulk extraction.
+"""
 
-```python
-import os
-import pandas as pd
-from datetime import datetime
-from typing import TypedDict, List, Dict, Optional, Any
+from typing import List, Optional
 from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage, SystemMessage
 
-# LangChain & LangGraph imports
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, START, END
-from langchain_community.document_loaders import PyPDFLoader
+from graph.graph_state import FinancialGraphState
 
-# Azure Blob Storage import
-from azure.storage.blob import BlobServiceClient
-```
-```python
-# 1. Credentials & LLM Setup
 
-os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope",
-    key="openai-apim-api-key"
+# Updated Pydantic model
+class ExtractedAnswer(BaseModel):
+    worksheet: str = Field(description="The worksheet name this variable belongs to")
+    variable: str = Field(description="The name of the variable being extracted")
+    description: str = Field(default="", description="Optional description of the variable")
+    answer: str = Field(description="The extracted value, or 'N/A' if not found")
+    year: Optional[int] = Field(
+        default=None, 
+        description="The financial year this metric applies to (e.g., 2023, 2024). Set to null if not found."
+    )
+    confidence: float = Field(
+        description="Confidence score between 0.0 and 1.0 based on how clearly the document states the value."
+    )
+    page_number: int = Field(
+        description="The page number where the information was found. Set to -1 if not found."
+    )
+
+class ExtractionResponse(BaseModel):
+    answers: List[ExtractedAnswer] = Field(
+        default_factory=list, 
+        description="List of extracted answers for all requested variables."
+    )
+    errors: List[str] = Field(default_factory=list)
+
+# Updated System Prompt
+SYSTEM_PROMPT = (
+    "You are an intelligent financial assistant helping credit teams analyze "
+    "and extract valuable insights from annual reports of companies. "
+    "Extract the requested financial data points from the provided document context. "
+    "For each metric, extract the value, the financial year it applies to, and the page number. "
+    "If a specific variable is not available in the document, set the answer to 'N/A', "
+    "the year to null, confidence to 0.0, and page_number to -1. "
+    "Be precise and provide only the requested values without additional explanation."
 )
-os.environ["AZURE_OAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
-os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
-os.environ["SA_ACCESSKEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope",
-    key="sta-eu-accesskey"
-)
-os.environ["ENVIRONMENT"] = "prd"
 
-# Use AzureChatOpenAI instead of standard ChatOpenAI
-llm = AzureChatOpenAI(
-    azure_endpoint=os.environ["AZURE_OAI_ENDPOINT"],
-    api_version="2024-08-01-preview",
-    api_key=os.environ["OPENAI_API_KEY"],
-    azure_deployment="gpt-4o",  # NOTE: Update this if your Azure deployment name differs
-    temperature=0.0
-)
-print("AzureChatOpenAI client initialized")
-```
-```python
-# 2. Azure Blob Storage Helpers
-blob_service_client = BlobServiceClient(
-    account_url=f"https://{os.environ['STORAGE_ACCOUNT']}.blob.core.windows.net",
-    credential=os.environ["SA_ACCESSKEY"]
-)
-CONTAINER_NAME = "projects"
 
-def download_blob_to_local(blob_path: str, local_path: str):
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
-    with open(local_path, "wb") as download_file:
-        download_file.write(blob_client.download_blob().readall())
-    print(f"Downloaded {blob_path} to Databricks local path {local_path}")
-
-def upload_local_to_blob(local_path: str, blob_path: str):
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
-    with open(local_path, "rb") as data:
-        blob_client.upload_blob(data, overwrite=True)
-    print(f"Uploaded {local_path} to Azure Blob {blob_path}")
-```
-```python
-# 3. Pydantic Schemas
-class MetricValue(BaseModel):
-    value: Optional[float] = Field(None, description="Extracted numeric value")
-    year: Optional[int] = Field(None, description="The financial year this metric applies to (e.g., 2023, 2024)")
-    page_number: Optional[int] = Field(None, description="The page number in the document where this value was found")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1")
-
-class ExtractedMetrics(BaseModel):
-    company: Optional[str] = None
-    period: Optional[str] = None
-    revenue: Optional[MetricValue] = Field(None, description="Also known as Net Sales")
-    net_sales: Optional[MetricValue] = None
-    gross_margin: Optional[MetricValue] = Field(None, description="Also known as Gross Income")
-    operating_income: Optional[MetricValue] = Field(None, description="Also known as EBIT")
-    net_income: Optional[MetricValue] = None
-    orders: Optional[MetricValue] = None
-    bookings: Optional[MetricValue] = None
-
-# Bind schema natively
-structured_llm = llm.with_structured_output(ExtractedMetrics)
-```
-```python
-# 4. Define Graph State
-class GraphState(TypedDict):
-    raw_data: str
-    pdf_path: str
-    extracted_metrics: Optional[ExtractedMetrics]
-    valid_metrics: List[Dict]
-    low_confidence_metrics: List[Dict]
-    company: Optional[str]
-    period: Optional[str]
-    excel_path: Optional[str]
-```
-```python
-# 5. Define Graph Nodes
-def extract_node(state: GraphState) -> GraphState:
-    print("-> Running Extraction Node")
+# Added Bulk Extraction
+def answer_questions(state: FinancialGraphState) -> ExtractionResponse:
+    """Use the LLM to extract all questions from the Excel template in a single call.
     
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a precise financial data extraction assistant. "
-                   "Extract the requested metrics from the provided document. "
-                   "For every numeric metric, you MUST extract the value, the specific year it belongs to, "
-                   "and the page number where you found it. "
-                   "Pay close attention to alternative names (e.g., Net Sales for Revenue, EBIT for Operating Income). "
-                   "If a metric is not found, set value to null and confidence to 0.0."),
-        ("user", "Data to process:\n{data}")
-    ])
+    - Gathers all variables into a single prompt
+    - Sends to LLM once for bulk extraction using structured output
+    - Captures confidence scores and page numbers for hyperlink generation
+    """
+    llm = state.get("llm")
+    excel_data = state.get("excel_data", [])
+    pdf_pages = state.get("pdf_pages", [])
+    errors = state.get("errors", [])
     
-    chain = prompt | structured_llm
-    result = chain.invoke({"data": state["raw_data"]})
-    
-    return {"extracted_metrics": result}
-
-def validate_node(state: GraphState) -> GraphState:
-    print("-> Running Validation Node")
-    extracted = state["extracted_metrics"]
-    threshold = 0.7
-    
-    metric_fields = [
-        "revenue", "net_sales", "gross_margin",
-        "operating_income", "net_income", "orders", "bookings"
-    ]
-
-    valid = []
-    low_confidence = []
-
-    for field in metric_fields:
-        metric = getattr(extracted, field)
-        if metric is None or metric.value is None:
-            continue
-
-        item = {
-            "Variable": field.replace("_", " ").title(),
-            "Value": metric.value,
-            "Year": metric.year,
-            "Page": metric.page_number,
-            "Score": metric.confidence
-        }
-
-        if metric.confidence >= threshold:
-            valid.append(item)
-        else:
-            low_confidence.append(item)
-
-    return {
-        "valid_metrics": valid,
-        "low_confidence_metrics": low_confidence,
-        "company": extracted.company,
-        "period": extracted.period
-    }
-
-def generate_excel_node(state: GraphState) -> GraphState:
-    print("-> Running Excel Generation Node")
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"financial_report_{timestamp}.xlsx"
-    
-    # Save to Databricks local /tmp directory for processing
-    local_output_dir = "/tmp/financial_reports"
-    os.makedirs(local_output_dir, exist_ok=True)
-    local_output_path = os.path.join(local_output_dir, output_filename)
-    
-    pdf_source = state.get("pdf_path", "source_document.pdf")
-    
-    sheet_configs = [{"sheet_name": "Extracted Metrics", "data": state["valid_metrics"]}]
-    if state["low_confidence_metrics"]:
-        sheet_configs.append({"sheet_name": "Needs Review", "data": state["low_confidence_metrics"]})
+    if llm is None:
+        errors.append("LLM not available")
+        return ExtractionResponse(errors=errors)
+    if not pdf_pages:
+        errors.append("No PDF content available")
+        return ExtractionResponse(errors=errors)
+    if not excel_data:
+        errors.append("No questions from Excel")
+        return ExtractionResponse(errors=errors)
         
-    with pd.ExcelWriter(local_output_path, engine='openpyxl') as writer:
-        for config in sheet_configs:
-            sheet_name = config["sheet_name"]
-            data = config.get("data", [])
-            df = pd.DataFrame(data)
-            
-            if not df.empty:
-                if 'No' not in df.columns:
-                    df.insert(0, 'No', range(1, len(df) + 1))
-                if 'Source Link' not in df.columns:
-                    pdf_filename = os.path.basename(pdf_source)
-                    df['Source Link'] = df['Page'].apply(
-                        lambda p: f'=HYPERLINK("{pdf_filename}#page={p}", "Page {p}")' if pd.notnull(p) else "N/A"
-                    )
-                
-                columns = ['No', 'Variable', 'Value', 'Year', 'Score', 'Source Link']
-                for col in columns:
-                    if col not in df.columns:
-                        df[col] = None
-                df = df[columns]
-                
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                worksheet = writer.sheets[sheet_name]
-                for idx, col in enumerate(df.columns):
-                    worksheet.column_dimensions[chr(65 + idx)].width = 20
-                for cell in worksheet[1]:
-                    cell.font = cell.font.copy(bold=True)
-            else:
-                pd.DataFrame(columns=['No', 'Variable', 'Value', 'Year', 'Score', 'Source Link']).to_excel(writer, sheet_name=sheet_name, index=False)
-                
-    return {"excel_path": local_output_path}
-```
-```python
-# 6. Build and Compile the Graph
-workflow = StateGraph(GraphState)
-
-workflow.add_node("extract", extract_node)
-workflow.add_node("validate", validate_node)
-workflow.add_node("export", generate_excel_node)
-
-workflow.add_edge(START, "extract")
-workflow.add_edge("extract", "validate")
-workflow.add_edge("validate", "export")
-workflow.add_edge("export", END)
-
-app = workflow.compile()
-```
-```python
-# 7. Helper: Extract text with pages
-def extract_text_with_pages(pdf_file_path: str) -> str:
-    print(f"Loading PDF: {pdf_file_path}")
-    loader = PyPDFLoader(pdf_file_path)
-    documents = loader.load()
+    # Prepare Document Context
+    full_context = "\n\n".join(
+        [f"--- Page {i+1} ---\n{page.get('text', '')}" for i, page in enumerate(pdf_pages)]
+    )
     
-    formatted_text = ""
-    for doc in documents:
-        page_num = doc.metadata.get('page', 0) + 1 
-        formatted_text += f"\n--- [Page {page_num}] ---\n{doc.page_content}\n"
+    # Prepare Variables List for the Prompt
+    variables_to_extract = []
+    for item in excel_data:
+        var_req = f"- Variable: '{item['variable']}' (Worksheet: {item['worksheet']})"
+        if item.get("description"):
+            var_req += f", Description: {item['description']}"
+        variables_to_extract.append(var_req)
         
-    return formatted_text
-```
-```python
-# 8. Main Execution
-if __name__ == "__main__":
+    variables_list_str = "\n".join(variables_to_extract)
     
-    # Define Azure Blob paths based on URL
-    input_blob_path = "FinancialSpreading/InputData/NL/Adyen/CL Adyen NV_Jurgen Geerts.pdf"
-    output_blob_folder = "FinancialSpreading/InputData/NL/Adyen"
+    # Construct the Single Prompt
+    system_msg = SystemMessage(content=SYSTEM_PROMPT)
+    user_content = (
+        f"Please extract the following variables:\n{variables_list_str}\n\n"
+        f"Document context:\n{full_context}"
+    )
     
-    pdf_file_name = os.path.basename(input_blob_path)
-    local_pdf_path = f"/tmp/{pdf_file_name}"
+    # Invoke LLM with Structured Output
+    structured_llm = llm.with_structured_output(ExtractionResponse)
     
     try:
-        # Step A: Download PDF from Azure to Databricks Driver
-        download_blob_to_local(input_blob_path, local_pdf_path)
+        response: ExtractionResponse = structured_llm.invoke([system_msg, HumanMessage(content=user_content)])
         
-        # Step B: Parse the PDF
-        extracted_raw_text = extract_text_with_pages(local_pdf_path)
-        
-        # Step C: Prepare Inputs
-        inputs = {
-            "raw_data": extracted_raw_text,
-            "pdf_path": local_pdf_path
-        }
-        
-        print("Initiating LangGraph Pipeline...")
-        final_state = app.invoke(inputs)
-        
-        print("\n=== Workflow Completed ===")
-        print(f"Company: {final_state.get('company')}")
-        print(f"Valid Metrics Found: {len(final_state.get('valid_metrics', []))}")
-        
-        # Step D: Upload generated Excel back to Azure Blob Storage
-        local_excel_path = final_state.get('excel_path')
-        if local_excel_path and os.path.exists(local_excel_path):
-            excel_filename = os.path.basename(local_excel_path)
-            output_blob_path = f"{output_blob_folder}/{excel_filename}"
+        # Merge any existing errors with new ones if they occurred
+        if errors:
+            response.errors.extend(errors)
             
-            upload_local_to_blob(local_excel_path, output_blob_path)
-            
-            final_url = f"https://{os.environ['STORAGE_ACCOUNT']}.blob.core.windows.net/projects/{output_blob_path}"
-            print(f"Output Successfully Uploaded To: {final_url}")
-            
+        return response
+        
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        errors.append(f"Bulk LLM extraction error: {str(e)}")
+        return ExtractionResponse(errors=errors)
+
+
+# OLD IMPLEMENTATION (COMMENTED OUT FOR COMPARISON)
+```
+```python
+# def answer_questions_old(state: FinancialGraphState) -> ExtractionResponse:
+#     """Use the LLM to answer each question from the Excel template.
+#
+#     For each row:
+#     - Constructs a prompt with the PDF context and the specific question
+#     - Sends to LLM for extraction
+#     - Collects the answer
+#     """
+#     llm = state.get("llm")
+#     excel_data = state.get("excel_data", [])
+#     pdf_pages = state.get("pdf_pages", [])
+#     errors = state.get("errors", [])
+#
+#     
+#     if llm is None:
+#         errors.append("LLM not available")
+#         return ExtractionResponse(errors=errors)
+#     if not pdf_pages:
+#         errors.append("No PDF content available")
+#         return ExtractionResponse(errors=errors)
+#     if not excel_data:
+#         errors.append("No questions from Excel")
+#         return ExtractionResponse(errors=errors)
+#
+#     
+#     full_context = "\n\n".join(
+#         [f"--- Page {i+1} ---\n{page.get('text', '')}" for i, page in enumerate(pdf_pages)]
+#     )
+#
+#     system_msg = SystemMessage(content=SYSTEM_PROMPT)
+#     answers = []
+#
+#     for item in excel_data:
+#         variable = item["variable"]
+#         description = item.get("description", "")
+#         worksheet = item["worksheet"]
+#
+#         question = f"From the following document, extract the value for: {variable}"
+#         if description:
+#             question += f"\nDescription: {description}"
+#         question += f"\n\nDocument context:\n{full_context}"
+#
+#         try:
+#             response = llm.invoke([system_msg, HumanMessage(content=question)])
+#             answer_text = response.content.strip()
+#         except Exception as e:
+#             answer_text = f"ERROR: {str(e)}"
+#             errors.append(f"LLM error for '{variable}': {str(e)}")
+#
+#         
+#         answers.append(
+#             ExtractedAnswer(
+#                 worksheet=worksheet,
+#                 variable=variable,
+#                 description=description,
+#                 answer=answer_text,
+#             )
+#         )
+#
+```
+## GIT COMMIT MESSAGE
+```python
+refactor: transition financial data extraction to single bulk LLM call
+```
+
+## GIT COMMIT DESCRIPTION
+```python
+- Replaced the sequential `for` loop of LLM calls with a single `with_structured_output` invocation to process all variables at once, significantly reducing token costs and execution time.
+- Expanded the `ExtractedAnswer` Pydantic schema to include `confidence`, `page_number`, and `year` fields to support downstream validation and Excel hyperlink generation.
+- Updated the `SYSTEM_PROMPT` to instruct the LLM on handling missing data with explicit fallback values (e.g., confidence 0.0, page_number -1).
+- Commented out the legacy `answer_questions` function to preserve it for A/B testing and comparison per team lead request.
+```
+#     
+#     return ExtractionResponse(answers=answers, errors=errors)
 ```
