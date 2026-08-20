@@ -1,275 +1,131 @@
 ```python
-%pip install langchain langchain-community langchain-openai langgraph pydantic azure-storage-blob openpyxl pypdf
-dbutils.library.restartPython()
-```
-
-```python
-import os
-import pandas as pd
-import urllib.parse
-from datetime import datetime
-from typing import TypedDict, List, Dict, Optional, Any
 from pydantic import BaseModel, Field
+from typing import Optional, List
 
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, START, END
-from langchain_community.document_loaders import PyPDFLoader
+class ExtractedAnswer(BaseModel):
+    """Schema for individual metric extractions."""
+    worksheet: str = Field(description="The worksheet name this variable belongs to")
+    variable: str = Field(description="The name of the variable being extracted")
+    answer: str = Field(description="The extracted value as given in the source document, or 'N/A' if not found")
+    confidence: float = Field(
+        description="Confidence score between 0.0 and 1.0 based on how clearly the document states the value."
+    )
+    page_number: int = Field(
+        description="The page number where the information was found. Set to -1 if not found."
+    )
+    source_fields: List[str] = Field(
+        default_factory=list, 
+        description="List of fields in the source document used to extract the answer."
+    )
+    formula: Optional[str] = Field(
+        default=None, 
+        description="Formula used to calculate the answer based on source fields."
+    )
+    # ADDED: Container for the generated hyperlink formula
+    source_link: Optional[str] = Field(
+        default="N/A", 
+        description="Excel HYPERLINK formula pointing to the exact source page in Azure Blob."
+    )
 
-from azure.storage.blob import BlobServiceClient
-
-# Environment Setup
-os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope",
-    key="openai-apim-api-key"
-)
-os.environ["AZURE_OAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
-os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
-os.environ["SA_ACCESSKEY"] = dbutils.secrets.get(
-    scope="azure-key-vault-scope",
-    key="sta-eu-accesskey"
-)
-os.environ["ENVIRONMENT"] = "prd"
-
-# Client Initialization 
-llm = AzureChatOpenAI(
-    azure_endpoint=os.environ["AZURE_OAI_ENDPOINT"],
-    api_version="2024-08-01-preview",
-    api_key=os.environ["OPENAI_API_KEY"],
-    azure_deployment="gpt-4o",  
-    temperature=0.0
-)
-print("AzureChatOpenAI client initialized")
-
-blob_service_client = BlobServiceClient(
-    account_url=f"https://{os.environ['STORAGE_ACCOUNT']}.blob.core.windows.net",
-    credential=os.environ["SA_ACCESSKEY"]
-)
-CONTAINER_NAME = "projects"
-
-def download_blob_to_local(blob_path: str, local_path: str):
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
-    with open(local_path, "wb") as download_file:
-        download_file.write(blob_client.download_blob().readall())
-    print(f"Downloaded {blob_path} to Databricks local path {local_path}")
-
-def upload_local_to_blob(local_path: str, blob_path: str):
-    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_path)
-    with open(local_path, "rb") as data:
-        blob_client.upload_blob(data, overwrite=True)
-    print(f"Uploaded {local_path} to Azure Blob {blob_path}")
+class ExtractionResponse(BaseModel):
+    """Overall extracted response from the LLM."""
+    year: Optional[int] = Field(default=None, description="The financial year this metric applies to.")
+    currency: Optional[str] = Field(default=None, description="The currency used (e.g., 'EUR', 'USD').")
+    scale: Optional[str] = Field(default=None, description="The scale used (e.g., 'thousands', 'millions').")
+    answers: List[ExtractedAnswer] = Field(default_factory=list, description="List of extracted answers.")
+    errors: List[str] = Field(default_factory=list)
 ```
 
 ```python
-# Pydantic Models
-class MetricValue(BaseModel):
-    value: Optional[float] = Field(None, description="Extracted numeric value")
-    year: Optional[int] = Field(None, description="The financial year this metric applies to (e.g., 2023, 2024)")
-    page_number: Optional[int] = Field(None, description="The page number in the document where this value was found")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1")
+from typing import TypedDict, List, Dict, Any, Optional
 
-class ExtractedMetrics(BaseModel):
-    company: Optional[str] = None
-    period: Optional[str] = None
-    revenue: Optional[MetricValue] = Field(None, description="Also known as Net Sales")
-    net_sales: Optional[MetricValue] = None
-    gross_margin: Optional[MetricValue] = Field(None, description="Also known as Gross Income")
-    operating_income: Optional[MetricValue] = Field(None, description="Also known as EBIT")
-    net_income: Optional[MetricValue] = None
-    orders: Optional[MetricValue] = None
-    bookings: Optional[MetricValue] = None
-
-structured_llm = llm.with_structured_output(ExtractedMetrics, method="function_calling")
-
-# LangGraph State
-class GraphState(TypedDict):
-    raw_data: str
-    pdf_path: str
-    blob_pdf_url: str  
-    extracted_metrics: Optional[ExtractedMetrics]
-    valid_metrics: List[Dict]
-    low_confidence_metrics: List[Dict]
-    company: Optional[str]
-    period: Optional[str]
-    excel_path: Optional[str]
+class FinancialGraphState(TypedDict, total=False):
+    llm: Any
+    blob_pdf_url: str
+    excel_data: List[Dict[str, Any]]
+    selected_pages: List[Dict[str, Any]]
+    errors: List[str]
+    extraction_response: Optional[ExtractionResponse]
 ```
 
 ```python
-# Graph Nodes
-def extract_node(state: GraphState) -> GraphState:
-    print("-> Running Extraction Node")
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a precise financial data extraction assistant. "
-                   "Extract the requested metrics from the provided document. "
-                   "For every numeric metric, you MUST extract the value, the specific year it belongs to, "
-                   "and the page number where you found it. "
-                   "Pay close attention to alternative names (e.g., Net Sales for Revenue, EBIT for Operating Income). "
-                   "If a metric is not found, set value to null and confidence to 0.0."),
-        ("user", "Data to process:\n{data}")
-    ])
-    
-    chain = prompt | structured_llm
-    result = chain.invoke({"data": state["raw_data"]})
-    
-    return {"extracted_metrics": result}
+"""Node: Answer Questions using LLM with Source Deep Linking."""
 
-def validate_node(state: GraphState) -> GraphState:
-    print("-> Running Validation Node")
-    extracted = state["extracted_metrics"]
-    threshold = 0.7
-    
-    metric_fields = [
-        "revenue", "net_sales", "gross_margin",
-        "operating_income", "net_income", "orders", "bookings"
-    ]
+from typing import List, Optional
+from langchain_core.messages import HumanMessage, SystemMessage
 
-    valid = []
-    low_confidence = []
+from graph.graph_state import FinancialGraphState
+from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.user_prompt import get_user_prompt
+from models import ExtractionResponse, ExtractedAnswer
 
-    for field in metric_fields:
-        metric = getattr(extracted, field)
-        if metric is None or metric.value is None:
-            continue
 
-        item = {
-            "Variable": field.replace("_", " ").title(),
-            "Value": metric.value,
-            "Year": metric.year,
-            "Page": metric.page_number,
-            "Score": metric.confidence
-        }
+def build_hyperlink(page_number: Optional[int], blob_pdf_url: str) -> str:
+    """Helper function applying the exact Excel HYPERLINK formula logic."""
+    if page_number is not None and page_number != -1 and blob_pdf_url:
+        return f'=HYPERLINK("{blob_pdf_url}#page={page_number}", "Page {page_number}")'
+    return "N/A"
 
-        if metric.confidence >= threshold:
-            valid.append(item)
-        else:
-            low_confidence.append(item)
 
-    return {
-        "valid_metrics": valid,
-        "low_confidence_metrics": low_confidence,
-        "company": extracted.company,
-        "period": extracted.period
-    }
+def answer_questions(state: FinancialGraphState) -> dict:
+    """Extract metrics via LLM and enrich each answer with an Excel hyperlink."""
+    llm = state.get("llm")
+    structured_llm = llm.with_structured_output(ExtractionResponse)
 
-def generate_excel_node(state: GraphState) -> GraphState:
-    print("-> Running Excel Generation Node")
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"financial_report_{timestamp}.xlsx"
-    
-    local_output_dir = "/tmp/financial_reports"
-    os.makedirs(local_output_dir, exist_ok=True)
-    local_output_path = os.path.join(local_output_dir, output_filename)
-    
+    excel_data = state.get("excel_data", [])
+    errors = state.get("errors", [])
+    selected_pages = state.get("selected_pages", [])
     blob_pdf_url = state.get("blob_pdf_url", "")
-    
-    sheet_configs = [{"sheet_name": "Extracted Metrics", "data": state["valid_metrics"]}]
-    if state["low_confidence_metrics"]:
-        sheet_configs.append({"sheet_name": "Needs Review", "data": state["low_confidence_metrics"]})
-        
-    with pd.ExcelWriter(local_output_path, engine='openpyxl') as writer:
-        for config in sheet_configs:
-            sheet_name = config["sheet_name"]
-            data = config.get("data", [])
-            df = pd.DataFrame(data)
-            
-            if not df.empty:
-                if 'No' not in df.columns:
-                    df.insert(0, 'No', range(1, len(df) + 1))
-                if 'Source Link' not in df.columns:
-                    df['Source Link'] = df['Page'].apply(
-                        lambda p: f'=HYPERLINK("{blob_pdf_url}#page={p}", "Page {p}")' if pd.notnull(p) else "N/A"
-                    )
-                
-                columns = ['No', 'Variable', 'Value', 'Year', 'Score', 'Source Link']
-                for col in columns:
-                    if col not in df.columns:
-                        df[col] = None
-                df = df[columns]
-                
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                worksheet = writer.sheets[sheet_name]
-                for idx, col in enumerate(df.columns):
-                    worksheet.column_dimensions[chr(65 + idx)].width = 20
-                for cell in worksheet[1]:
-                    cell.font = cell.font.copy(bold=True)
-            else:
-                pd.DataFrame(columns=['No', 'Variable', 'Value', 'Year', 'Score', 'Source Link']).to_excel(writer, sheet_name=sheet_name, index=False)
-                
-    return {"excel_path": local_output_path}
-```
 
-```python
-# Graph Orchestration
-workflow = StateGraph(GraphState)
-
-workflow.add_node("extract", extract_node)
-workflow.add_node("validate", validate_node)
-workflow.add_node("export", generate_excel_node)
-
-workflow.add_edge(START, "extract")
-workflow.add_edge("extract", "validate")
-workflow.add_edge("validate", "export")
-workflow.add_edge("export", END)
-
-app = workflow.compile()
-
-# Helper function
-def extract_text_with_pages(pdf_file_path: str) -> str:
-    print(f"Loading PDF: {pdf_file_path}")
-    loader = PyPDFLoader(pdf_file_path)
-    documents = loader.load()
+    USER_PROMPT = get_user_prompt(excel_data)
     
-    formatted_text = ""
-    for doc in documents:
-        page_num = doc.metadata.get('page', 0) + 1 
-        formatted_text += f"\n--- [Page {page_num}] ---\n{doc.page_content}\n"
-        
-    return formatted_text
-```
-```python
-# Main Execution
-if __name__ == "__main__":
-    
-    input_blob_path = "FinancialSpreading/InputData/NL/Adyen/CL Adyen NV_Jurgen Geerts.pdf"
-    output_blob_folder = "FinancialSpreading/InputData/NL/Adyen"
-    
-    pdf_file_name = os.path.basename(input_blob_path)
-    local_pdf_path = f"/tmp/{pdf_file_name}"
-    
-    # Construct the absolute Azure Blob URL securely, encoding spaces to be web-safe
-    storage_account = os.environ['STORAGE_ACCOUNT']
-    encoded_blob_path = urllib.parse.quote(input_blob_path)
-    blob_pdf_url = f"https://{storage_account}.blob.core.windows.net/{CONTAINER_NAME}/{encoded_blob_path}"
+    # Prepare Document Context with page markers
+    full_context = "\n\n".join(
+        [f"--- Page {i+1} ---\n{page.get('text', '')}" for i, page in enumerate(selected_pages)]
+    )
+
+    user_content = (
+        f"Please extract the following variables:\n{USER_PROMPT}\n\n"
+        f"Document context:\n{full_context}\n\n"
+        "IMPORTANT: You MUST identify the source page number referencing the '--- Page X ---' headers. "
+        "Set page_number to -1 if the information is not present."
+    )
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT), 
+        HumanMessage(content=user_content)
+    ]
     
     try:
-        download_blob_to_local(input_blob_path, local_pdf_path)
-        extracted_raw_text = extract_text_with_pages(local_pdf_path)
+        response: ExtractionResponse = structured_llm.invoke(messages)
         
-        inputs = {
-            "raw_data": extracted_raw_text,
-            "pdf_path": local_pdf_path,
-            "blob_pdf_url": blob_pdf_url 
-        }
-        
-        print("Initiating LangGraph Pipeline...")
-        final_state = app.invoke(inputs)
-        
-        print("\n=== Workflow Completed ===")
-        print(f"Company: {final_state.get('company')}")
-        print(f"Valid Metrics Found: {len(final_state.get('valid_metrics', []))}")
-        
-        local_excel_path = final_state.get('excel_path')
-        if local_excel_path and os.path.exists(local_excel_path):
-            excel_filename = os.path.basename(local_excel_path)
-            output_blob_path = f"{output_blob_folder}/{excel_filename}"
+        # Merge previous pipeline errors if present
+        if errors:
+            response.errors.extend(errors)
             
-            upload_local_to_blob(local_excel_path, output_blob_path)
+        # Post-process: Inject source hyperlinks into each extracted answer
+        for answer in response.answers:
+            answer.source_link = build_hyperlink(answer.page_number, blob_pdf_url)
             
-            final_url = f"https://{storage_account}.blob.core.windows.net/{CONTAINER_NAME}/{urllib.parse.quote(output_blob_path)}"
-            print(f"Output Successfully Uploaded To: {final_url}")
-            
+        return {"extraction_response": response, "errors": response.errors}
+        
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        error_msg = f"Bulk LLM extraction error: {str(e)}"
+        errors.append(error_msg)
+        return {
+            "extraction_response": ExtractionResponse(errors=[error_msg]),
+            "errors": errors
+        }
+```
+
+```python
+feat(extraction): add PDF source hyperlinks to extracted metrics
+
+Updated the extraction pipeline to automatically generate Excel-ready hyperlink formulas that deep-link to the specific source page in the Azure Blob PDF. 
+
+- Added `source_link` field to the `ExtractedAnswer` Pydantic model to store the formula.
+- Tracked `blob_pdf_url` in `FinancialGraphState` to provide the base URL.
+- Created `build_hyperlink` helper function in the `answer_questions` node to apply the precise formatting logic.
+- Implemented a post-processing step after the LLM invocation to map integer page numbers to the `=HYPERLINK` formula, preventing the LLM from hallucinating URL syntax.
+- Updated LLM prompt instructions to strictly enforce a `-1` fallback for missing page numbers, ensuring broken links are not generated.
 ```
