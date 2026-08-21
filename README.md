@@ -173,4 +173,30 @@ workflow.add_conditional_edges(
 )
 ```
 
-This also follows Saumya's specific instruction that refinement should use the **existing extraction output**, rather than extracting everything again. 
+For the confidence-based refinement work, I’d suggest:
+
+**Branch name**
+
+```text
+feature/financial-spreading-confidence-refinement
+```
+
+**Commit message**
+
+```text
+feat: add confidence-based extraction refinement loop
+```
+
+**Commit description**
+
+```text
+Add a configurable confidence threshold and maximum refinement
+attempts for financial metric extraction.
+
+- Check extracted metric confidence against the configured threshold.
+- Refine only low-confidence extraction results.
+- Loop the refined results back through the confidence check.
+- Stop refinement after the configured maximum attempts.
+- Keep the existing financial spreading extraction flow unchanged.
+```
+
