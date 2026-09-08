@@ -208,10 +208,7 @@ from nodes.validate_refinement import validate_refinement
 ```
 
 ```python
-workflow.add_node(
-    "validate_refinement",
-    validate_refinement,
-)
+workflow.add_node("validate_refinement",validate_refinement)
 ```
 
 ```python
@@ -224,10 +221,7 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge(
-    "validate_refinement",
-    "create_excel_output",
-)
+workflow.add_edge("validate_refinement","create_excel_output")
 ```
 
 ```python
