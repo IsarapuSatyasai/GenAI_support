@@ -138,36 +138,196 @@ class FinancialGraphState(TypedDict, total=False):
 Keep the existing extraction logic and change the final state update so the initial extraction is preserved separately.
 
 ```python
-try:
-    response: ExtractionResponse = structured_llm.invoke(messages)
+"""Node: Answer Questions using LLM.
 
-    if errors:
-        response.errors.extend(errors)
+Iterates over each Excel row and extracts the corresponding financial
+data point from the PDF context and added source hyperlink.
+"""
+
+from typing import List, Dict, Any, Optional
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from graph.graph_state import FinancialGraphState
+from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.user_prompt import get_user_prompt
+from models import ExtractionResponse
+
+from config import get_settings
+
+
+def build_hyperlink(page_number: Optional[int], source_link: str) -> str:
+    """Helper function applying the exact Excel HYPERLINK formula logic."""
+    if page_number is not None and page_number != -1 and source_link:
+        return f'=HYPERLINK("{source_link}#page={page_number}", "Page {page_number}")'
+    return "N/A"
+
+
+def align_answers_to_template(
+    excel_data: List[Dict[str, Any]],
+    extracted_answers: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Align extracted answers with the existing Excel template metrics."""
+
+    answer_map = {
+        (
+            answer["worksheet"],
+            answer["variable"],
+        ): answer
+        for answer in extracted_answers
+        if (
+            answer["worksheet"],
+            answer["variable"],
+        ) in {
+            (
+                metric["worksheet"],
+                metric["variable"],
+            )
+            for metric in excel_data
+        }
+    }
 
     final_answers = []
 
-    for answer in response.answers:
-        answer.source_link = build_hyperlink(
-            answer.page_number,
-            source_link,
+    for metric in excel_data:
+        key = (
+            metric["worksheet"],
+            metric["variable"],
         )
-        final_answers.append(answer.model_dump())
 
-    return {
-        "original_answers": final_answers,
-        "answers": final_answers,
-        "errors": response.errors,
+        answer = answer_map.get(key)
+
+        if answer is None:
+            answer = {
+                "worksheet": metric["worksheet"],
+                "variable": metric["variable"],
+                "answer": "N/A",
+                "confidence": 0.0,
+                "page_number": -1,
+                "source_fields": [],
+                "formula": None,
+                "source_link": "N/A",
+            }
+
+        final_answers.append(answer)
+
+    return final_answers
+
+
+def validate_template_alignment(
+    excel_data: List[Dict[str, Any]],
+    answers: List[Dict[str, Any]],
+) -> None:
+    """Validate that final answers exactly match template metrics."""
+
+    template_keys = {
+        (
+            metric["worksheet"],
+            metric["variable"],
+        )
+        for metric in excel_data
     }
 
-except Exception as exc:
-    error_msg = f"Bulk LLM extraction error: {exc}"
-    errors.append(error_msg)
-
-    return {
-        "original_answers": [],
-        "answers": [],
-        "errors": errors,
+    answer_keys = {
+        (
+            answer["worksheet"],
+            answer["variable"],
+        )
+        for answer in answers
     }
+
+    if template_keys != answer_keys:
+        missing_metrics = template_keys - answer_keys
+        new_metrics = answer_keys - template_keys
+
+        raise ValueError(
+            f"Template alignment failed. "
+            f"Missing metrics: {missing_metrics}. "
+            f"New metrics: {new_metrics}."
+        )
+
+    if len(excel_data) != len(answers):
+        raise ValueError(
+            f"Metric count mismatch. "
+            f"Template: {len(excel_data)}, "
+            f"Answers: {len(answers)}."
+        )
+
+
+def answer_questions(state: FinancialGraphState) -> dict:
+    """Extract metrics via LLM and enrich each answer with an Excel hyperlink."""
+    llm = state.get("llm")
+    structured_llm = llm.with_structured_output(ExtractionResponse)
+
+    excel_data = state.get("excel_data", [])
+    errors = state.get("errors", [])
+    selected_pages = state.get("selected_pages", [])
+    pdf_file_name = state.get("pdf_file_name", "")
+  
+    settings = get_settings()
+    source_link = settings.sharepoint_link + pdf_file_name.replace(" ", "%20")
+
+
+    USER_PROMPT = get_user_prompt(excel_data)
+    
+    full_context = "\n\n".join(
+        [f"--- Page {i+1} ---\n{page.get('text', '')}" for i, page in enumerate(selected_pages)]
+    )
+
+    user_content = (
+        f"Please extract the following variables:\n{USER_PROMPT}\n\n"
+        f"Document context:\n{full_context}\n\n"
+    )
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT), 
+        HumanMessage(content=user_content)
+    ]
+    
+    try:
+        response: ExtractionResponse = structured_llm.invoke(messages)
+
+        if errors:
+            response.errors.extend(errors)
+
+        extracted_answers = []
+
+        for answer in response.answers:
+            answer.source_link = build_hyperlink(
+                answer.page_number,
+                source_link,
+            )
+            extracted_answers.append(answer.model_dump())
+
+        final_answers = align_answers_to_template(
+            excel_data,
+            extracted_answers,
+        )
+
+        validate_template_alignment(
+            excel_data,
+            final_answers,
+        )
+
+        return {
+            "original_answers": final_answers,
+            "answers": final_answers,
+            "errors": response.errors,
+        }
+
+    except Exception as exc:
+        error_msg = f"Bulk LLM extraction error: {exc}"
+        errors.append(error_msg)
+
+        final_answers = align_answers_to_template(
+            excel_data,
+            [],
+        )
+
+        return {
+            "original_answers": final_answers,
+            "answers": final_answers,
+            "errors": errors,
+        }
 ```
 
 # 4. prompts/refinement_prompt.py
