@@ -37,39 +37,88 @@ for answer in response.answers:
 Replace it with:
 
 ```python
-template_lookup = {
-    (
-        item["worksheet"],
-        item["variable"],
-    ): item
-    for item in excel_data
-}
+def answer_questions(state: FinancialGraphState) -> dict:
+    """Extract metrics via LLM and enrich each answer with an Excel hyperlink."""
+    llm = state.get("llm")
+    structured_llm = llm.with_structured_output(ExtractionResponse)
 
-final_answers = []
+    excel_data = state.get("excel_data", [])
+    errors = state.get("errors", [])
+    selected_pages = state.get("selected_pages", [])
+    pdf_file_name = state.get("pdf_file_name", "")
+  
+    settings = get_settings()
+    source_link = settings.sharepoint_link + pdf_file_name.replace(" ", "%20")
 
-for answer in response.answers:
-    answer_data = answer.model_dump()
 
-    key = (
-        answer_data.get("worksheet"),
-        answer_data.get("variable"),
+    USER_PROMPT = get_user_prompt(excel_data)
+    
+    full_context = "\n\n".join(
+        [f"--- Page {i+1} ---\n{page.get('text', '')}" for i, page in enumerate(selected_pages)]
     )
 
-    template_metric = template_lookup.get(key)
-
-    if template_metric is None:
-        continue
-
-    # Preserve the original template schema
-    answer_data["worksheet"] = template_metric["worksheet"]
-    answer_data["variable"] = template_metric["variable"]
-
-    answer_data["source_link"] = build_hyperlink(
-        answer_data.get("page_number"),
-        source_link,
+    user_content = (
+        f"Please extract the following variables:\n{USER_PROMPT}\n\n"
+        f"Document context:\n{full_context}\n\n"
     )
 
-    final_answers.append(answer_data)
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT), 
+        HumanMessage(content=user_content)
+    ]
+    
+    try:
+        response: ExtractionResponse = structured_llm.invoke(messages)
+        
+        if errors:
+            response.errors.extend(errors)
+        
+        template_lookup = {
+          (
+            item["worksheet"],
+            item["variable"],
+          ): item
+           for item in excel_data
+        }
+            
+        final_answers = []
+
+        for answer in response.answers:
+            answer_data = answer.model_dump()
+
+            key = (
+                answer_data.get("worksheet"),
+                answer_data.get("variable"),
+            )
+
+            template_metric = template_lookup.get(key)
+
+            if template_metric is None:
+                continue
+
+            # Preserve the original template schema
+            answer_data["worksheet"] = template_metric["worksheet"]
+            answer_data["variable"] = template_metric["variable"]
+
+            answer_data["source_link"] = build_hyperlink(
+                answer_data.get("page_number"),
+                source_link,
+            )
+
+            final_answers.append(answer_data)
+                    
+                return {
+                    "answers": final_answers, 
+                    "errors": response.errors
+                }
+        
+    except Exception as e:
+        error_msg = f"Bulk LLM extraction error: {str(e)}"
+        errors.append(error_msg)
+        return {
+            "answers": [],
+            "errors": errors
+        }
 ```
 
 This prevents the initial LLM output from introducing different worksheet/variable names. Your current code directly accepts the LLM's `worksheet` and `variable`.
