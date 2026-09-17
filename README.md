@@ -1,4 +1,3 @@
-````markdown
 # Confidence Refinement Implementation
 
 ## Branch Name
