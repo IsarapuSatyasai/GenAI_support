@@ -1,56 +1,154 @@
-### Refinement changes
+### 1. `config.py`
 
-Modify `config.py` so refinement stops after 2 attempts:
+Find:
+
+```python
+MAX_REFINEMENT_ATTEMPTS = 3
+```
+
+Replace with:
 
 ```python
 REFINEMENT_CONFIDENCE_THRESHOLD = 0.70
 MAX_REFINEMENT_ATTEMPTS = 2
 ```
 
-Modify `nodes/confidence_refinement.py` so the original answer is verified first and refinement only improves the existing answer:
+The threshold already exists in your branch, so don't duplicate it.
+
+---
+
+### 2. `nodes/answer_questions.py`
+
+**Purpose:** Keep the worksheet and variable from the Excel template fixed.
+
+Find this existing section:
 
 ```python
-original_verification = _verify_answer(
-    llm,
-    answer,
-    pdf_context,
-)
+final_answers = []
 
-if original_verification.get("is_correct"):
-    current_answers.append(answer.copy())
-    continue
-
-confidence = float(
-    answer.get("confidence", 0.0)
-)
-
-if (
-    confidence < REFINEMENT_CONFIDENCE_THRESHOLD
-    or not original_verification.get("is_correct")
-):
-    candidate = _refine_answer(
-        llm,
-        answer,
-        pdf_context,
+for answer in response.answers:
+    answer.source_link = build_hyperlink(
+        answer.page_number,
+        source_link,
     )
-
-    # Preserve the original template schema
-    candidate["worksheet"] = answer["worksheet"]
-    candidate["variable"] = answer["variable"]
-
-    refined_verification = _verify_answer(
-        llm,
-        candidate,
-        pdf_context,
-    )
-
-    if refined_verification.get("is_correct"):
-        current_answers.append(candidate)
-    else:
-        current_answers.append(answer.copy())
+    final_answers.append(answer.model_dump())
 ```
 
-Update `_refine_answer()`:
+Replace it with:
+
+```python
+template_lookup = {
+    (
+        item["worksheet"],
+        item["variable"],
+    ): item
+    for item in excel_data
+}
+
+final_answers = []
+
+for answer in response.answers:
+    answer_data = answer.model_dump()
+
+    key = (
+        answer_data.get("worksheet"),
+        answer_data.get("variable"),
+    )
+
+    template_metric = template_lookup.get(key)
+
+    if template_metric is None:
+        continue
+
+    # Preserve the original template schema
+    answer_data["worksheet"] = template_metric["worksheet"]
+    answer_data["variable"] = template_metric["variable"]
+
+    answer_data["source_link"] = build_hyperlink(
+        answer_data.get("page_number"),
+        source_link,
+    )
+
+    final_answers.append(answer_data)
+```
+
+This prevents the initial LLM output from introducing different worksheet/variable names. Your current code directly accepts the LLM's `worksheet` and `variable`.
+
+---
+
+### 3. `nodes/confidence_refinement.py`
+
+**Purpose:** Verify the existing answer first, refine only when needed, and verify the refinement.
+
+#### Step 3.1 — Replace `REFINEMENT_PROMPT`
+
+```python
+REFINEMENT_PROMPT = """
+You are refining an existing financial extraction.
+
+The Excel template schema is fixed.
+
+Do NOT create new worksheets.
+Do NOT create new variables.
+Do NOT rename worksheets or variables.
+Do NOT move metrics between worksheets.
+Do NOT extract unrelated metrics.
+
+Review the existing answer using the provided PDF evidence.
+
+Check:
+- existing answer
+- page number
+- financial year
+- unit or scale
+- source fields
+- formula when applicable
+- surrounding PDF context
+
+If the existing answer is correct, keep it unchanged.
+If the PDF supports a better answer, return the improved answer.
+
+Do not guess or invent information.
+
+The worksheet and variable must remain exactly unchanged.
+"""
+```
+
+#### Step 3.2 — Replace `VERIFICATION_PROMPT`
+
+```python
+VERIFICATION_PROMPT = """
+You are verifying an existing financial extraction against an annual report.
+
+The PDF evidence is the source of truth.
+
+Verify:
+
+1. Whether the answer is supported by the PDF.
+2. Whether the source fields semantically match the requested metric.
+3. Whether the financial year is correct.
+4. Whether the unit or scale is correct.
+5. Whether the cited page supports the answer.
+6. Whether the formula or calculation is correct when applicable.
+7. Whether the surrounding PDF context supports the interpretation.
+
+The source wording does not need to exactly match the requested
+variable. Evaluate the financial meaning and context.
+
+Do not change the worksheet or variable.
+Do not assume high confidence means the answer is correct.
+
+Return is_correct=true only when the PDF evidence supports the
+candidate sufficiently.
+
+If the candidate is incorrect and the correct value can be determined
+from the PDF, return the supported value.
+
+Do not invent information.
+"""
+```
+
+#### Step 3.3 — Replace `_refine_answer()`
 
 ```python
 def _refine_answer(
@@ -91,85 +189,181 @@ PDF evidence:
     return candidate
 ```
 
-Update the refinement prompt:
+#### Step 3.4 — Replace `confidence_refinement()`
+
+Replace the **entire existing `confidence_refinement()` function** with:
 
 ```python
-REFINEMENT_PROMPT = """
-You are refining an existing financial extraction.
+def confidence_refinement(
+    state: FinancialGraphState,
+) -> dict:
+    answers = state.get("answers", [])
+    attempts = state.get("refinement_attempts", 0)
 
-The Excel template schema is fixed.
+    original_answers = state.get("original_answers")
 
-Do NOT create new worksheets.
-Do NOT create new variables.
-Do NOT rename worksheets or variables.
-Do NOT move metrics between worksheets.
-Do NOT extract unrelated metrics.
+    if original_answers is None:
+        original_answers = [
+            answer.copy()
+            for answer in answers
+        ]
 
-Review the existing answer using the provided PDF evidence.
+    llm = state.get("llm")
 
-Check:
-- existing answer
-- page number
-- financial year
-- unit or scale
-- source fields
-- formula when applicable
-- surrounding PDF context
+    if llm is None:
+        raise ValueError(
+            "LLM is missing from graph state"
+        )
 
-If the existing answer is correct, keep it unchanged.
-If the PDF supports a better answer, return the improved answer.
+    selected_pages = state.get(
+        "selected_pages",
+        [],
+    )
 
-Do not guess or invent information.
+    pdf_context = _build_pdf_context(
+        selected_pages
+    )
 
-The worksheet and variable must remain exactly unchanged.
-"""
+    refined_answers = state.get(
+        "refined_answers",
+        [],
+    )
 
-VERIFICATION_PROMPT = """
-You are verifying an existing financial extraction against an annual report.
+    verification_results = state.get(
+        "verification_results",
+        [],
+    )
 
-The PDF evidence is the source of truth.
+    refined_by_metric = {
+        (
+            answer["worksheet"],
+            answer["variable"],
+        ): answer
+        for answer in refined_answers
+    }
 
-Verify:
+    verification_by_metric = {
+        (
+            result.get("worksheet"),
+            result["variable"],
+        ): result
+        for result in verification_results
+    }
 
-1. Whether the answer is supported by the PDF.
-2. Whether the source fields semantically match the requested metric.
-3. Whether the financial year is correct.
-4. Whether the unit or scale is correct.
-5. Whether the cited page supports the answer.
-6. Whether the formula or calculation is correct when applicable.
-7. Whether the surrounding PDF context supports the interpretation.
+    current_answers = []
 
-The source wording does not need to exactly match the requested
-variable. Evaluate the financial meaning and context.
+    for answer in answers:
+        variable = answer.get(
+            "variable",
+            "",
+        )
 
-Do not change the worksheet or variable.
-Do not assume high confidence means the answer is correct.
+        original_verification = _verify_answer(
+            llm,
+            answer,
+            pdf_context,
+        )
 
-Return is_correct=true only when the PDF evidence supports the
-candidate sufficiently.
+        verification_by_metric[
+            (
+                answer["worksheet"],
+                variable,
+            )
+        ] = original_verification
 
-If the candidate is incorrect and the correct value can be determined
-from the PDF, return the supported value.
+        if original_verification.get(
+            "is_correct",
+            False,
+        ):
+            current_answers.append(
+                answer.copy()
+            )
+            continue
 
-Do not invent information.
-"""
+        confidence = float(
+            answer.get(
+                "confidence",
+                0.0,
+            )
+        )
+
+        if (
+            confidence < REFINEMENT_CONFIDENCE_THRESHOLD
+            or not original_verification.get(
+                "is_correct",
+                False,
+            )
+        ):
+            candidate = _refine_answer(
+                llm,
+                answer,
+                pdf_context,
+            )
+
+            # Preserve the original template schema
+            candidate["worksheet"] = answer["worksheet"]
+            candidate["variable"] = answer["variable"]
+
+            refined_by_metric[
+                (
+                    answer["worksheet"],
+                    variable,
+                )
+            ] = candidate
+
+            refined_verification = _verify_answer(
+                llm,
+                candidate,
+                pdf_context,
+            )
+
+            verification_by_metric[
+                (
+                    answer["worksheet"],
+                    variable,
+                )
+            ] = refined_verification
+
+            if refined_verification.get(
+                "is_correct",
+                False,
+            ):
+                current_answers.append(
+                    candidate
+                )
+            else:
+                current_answers.append(
+                    answer.copy()
+                )
+        else:
+            current_answers.append(
+                answer.copy()
+            )
+
+    return {
+        "answers": current_answers,
+        "original_answers": original_answers,
+        "refined_answers": list(
+            refined_by_metric.values()
+        ),
+        "verification_results": list(
+            verification_by_metric.values()
+        ),
+        "refinement_attempts": attempts + 1,
+    }
 ```
 
-Keep verification details internal. Do not add them to the final answer:
+**Important:** Don't add these fields to `answers`:
 
 ```python
-verification_results.append(verification)
+verification_status
+verification_confidence
+verification_reason
 ```
 
-Do not add:
+Keep them inside `verification_results`.
 
-```python
-candidate["verification_status"] = "verified"
-candidate["verification_confidence"] = ...
-candidate["verification_reason"] = ...
-```
-
-Update `route_after_refinement()`:
+#### Step 3.5 — Replace `route_after_refinement()`
 
 ```python
 def route_after_refinement(
@@ -202,68 +396,15 @@ def route_after_refinement(
     return "refine"
 ```
 
-Use `(worksheet, variable)` as the refinement/verification key:
+**One correction:** with the above `confidence_refinement()` implementation, each graph iteration verifies the current answer and may refine it. Therefore `MAX_REFINEMENT_ATTEMPTS = 2` means the refinement node gets at most two graph passes.
 
-```python
-refined_by_metric = {
-    (
-        answer["worksheet"],
-        answer["variable"],
-    ): answer
-    for answer in refined_answers
-}
+---
 
-verification_by_metric = {
-    (
-        result.get("worksheet"),
-        result["variable"],
-    ): result
-    for result in verification_results
-}
-```
+### 4. `nodes/create_excel_output.py`
 
-### Answer schema changes
+**Purpose:** The Excel template, not the LLM, defines the final worksheets.
 
-Modify `nodes/answer_questions.py` so the LLM output cannot change the template identity:
-
-```python
-template_lookup = {
-    (
-        item["worksheet"],
-        item["variable"],
-    ): item
-    for item in excel_data
-}
-
-final_answers = []
-
-for answer in response.answers:
-    answer_data = answer.model_dump()
-
-    key = (
-        answer_data.get("worksheet"),
-        answer_data.get("variable"),
-    )
-
-    template_metric = template_lookup.get(key)
-
-    if template_metric is None:
-        continue
-
-    answer_data["worksheet"] = template_metric["worksheet"]
-    answer_data["variable"] = template_metric["variable"]
-
-    answer_data["source_link"] = build_hyperlink(
-        answer_data.get("page_number"),
-        source_link,
-    )
-
-    final_answers.append(answer_data)
-```
-
-### Excel output changes
-
-Modify `nodes/create_excel_output.py` so the original template defines the worksheets:
+#### Step 4.1 — Replace `build_excel_dateframes()`
 
 ```python
 def build_excel_dateframes(
@@ -292,10 +433,19 @@ def build_excel_dateframes(
         row = {
             "variable": variable,
             "answer": answer.get("answer"),
-            "confidence": answer.get("confidence", 0.0),
-            "source_fields": answer.get("source_fields"),
-            "formula": answer.get("formula"),
-            "source_link": answer.get("source_link"),
+            "confidence": answer.get(
+                "confidence",
+                0.0,
+            ),
+            "source_fields": answer.get(
+                "source_fields"
+            ),
+            "formula": answer.get(
+                "formula"
+            ),
+            "source_link": answer.get(
+                "source_link"
+            ),
         }
 
         worksheet_dict.setdefault(
@@ -305,32 +455,14 @@ def build_excel_dateframes(
 
     return {
         worksheet: pd.DataFrame(rows)
-        for worksheet, rows in worksheet_dict.items()
+        for worksheet, rows
+        in worksheet_dict.items()
     }
 ```
 
-Update `create_excel_output()`:
+#### Step 4.2 — Add schema validation
 
-```python
-answers = state.get("answers", [])
-template_metrics = state.get("excel_data", [])
-
-cleaned_answers = clean_llm_output(
-    answers
-)
-
-validate_template_schema(
-    answers=cleaned_answers,
-    template_metrics=template_metrics,
-)
-
-worksheet_dict = build_excel_dateframes(
-    answers=cleaned_answers,
-    template_metrics=template_metrics,
-)
-```
-
-Add schema validation:
+Add this function before `create_excel_output()`:
 
 ```python
 def validate_template_schema(
@@ -360,6 +492,59 @@ def validate_template_schema(
             "LLM produced metrics outside "
             f"the template schema: {sorted(unexpected)}"
         )
+```
+
+#### Step 4.3 — Modify `create_excel_output()`
+
+Find:
+
+```python
+answers = state.get("answers")
+```
+
+Change to:
+
+```python
+answers = state.get("answers", [])
+template_metrics = state.get("excel_data", [])
+```
+
+Then find:
+
+```python
+worksheet_dict = excel_preparation_chain.invoke(
+    answers
+)
+```
+
+Replace with:
+
+```python
+cleaned_answers = clean_llm_output(
+    answers
+)
+
+validate_template_schema(
+    answers=cleaned_answers,
+    template_metrics=template_metrics,
+)
+
+worksheet_dict = build_excel_dateframes(
+    answers=cleaned_answers,
+    template_metrics=template_metrics,
+)
+```
+
+The current `VerificationResult` model contains only `variable`, not `worksheet`.  Therefore, if you use `(worksheet, variable)` in `verification_by_metric`, you should also make this small change in `models.py`:
+
+```python
+class VerificationResult(BaseModel):
+    worksheet: str = Field(
+        description="The worksheet containing the variable."
+    )
+    variable: str = Field(
+        description="The variable being verified."
+    )
 ```
 
 **Commit Message:**
