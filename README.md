@@ -123,6 +123,36 @@ Do not guess or invent information.
 
 The worksheet and variable must remain exactly unchanged.
 """
+
+VERIFICATION_PROMPT = """
+You are verifying an existing financial extraction against an annual report.
+
+The PDF evidence is the source of truth.
+
+Verify:
+
+1. Whether the answer is supported by the PDF.
+2. Whether the source fields semantically match the requested metric.
+3. Whether the financial year is correct.
+4. Whether the unit or scale is correct.
+5. Whether the cited page supports the answer.
+6. Whether the formula or calculation is correct when applicable.
+7. Whether the surrounding PDF context supports the interpretation.
+
+The source wording does not need to exactly match the requested
+variable. Evaluate the financial meaning and context.
+
+Do not change the worksheet or variable.
+Do not assume high confidence means the answer is correct.
+
+Return is_correct=true only when the PDF evidence supports the
+candidate sufficiently.
+
+If the candidate is incorrect and the correct value can be determined
+from the PDF, return the supported value.
+
+Do not invent information.
+"""
 ```
 
 Keep verification details internal. Do not add them to the final answer:
