@@ -617,3 +617,373 @@ without changing the Excel template schema.
 - Keep verification details internal
 - Generate final Excel worksheets from the original template
 ```
+
+```python
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from config import (
+    MAX_REFINEMENT_ATTEMPTS,
+    REFINEMENT_CONFIDENCE_THRESHOLD,
+)
+from graph.graph_state import FinancialGraphState
+from models import ExtractionResponse, VerificationResponse
+
+
+REFINEMENT_PROMPT = """
+You are refining an existing financial extraction from an annual report.
+
+Use only the provided PDF evidence.
+
+Review the existing candidate and improve it only when the document
+provides sufficient evidence.
+
+Check:
+- correct metric or variable
+- correct numerical value
+- correct financial year
+- correct unit or scale
+- correct page
+- correct source fields
+- formula or calculation when applicable
+- surrounding PDF context
+
+Do not invent information.
+Do not use information outside the provided PDF evidence.
+
+Do not change the worksheet or variable name.
+Return the best supported candidate extraction.
+"""
+
+
+VERIFICATION_PROMPT = """
+You are verifying an existing financial extraction against an annual report.
+
+The PDF evidence is the source of truth.
+
+Verify:
+
+1. Whether the numerical value is supported by the PDF.
+2. Whether it belongs to the requested metric.
+3. Whether the financial year is correct.
+4. Whether the unit or scale is correct.
+5. Whether the cited page supports the answer.
+6. Whether the source fields support the extraction.
+7. Whether the formula or calculation is correct when applicable.
+8. Whether the surrounding PDF context supports the interpretation.
+
+Do not assume that a high confidence score means the answer is correct.
+
+Return is_correct=true only when the PDF evidence sufficiently supports
+the candidate.
+
+If the candidate is incorrect and the correct value can be determined
+from the PDF, return the supported value.
+
+Do not invent information.
+"""
+
+
+def _build_pdf_context(selected_pages):
+    context = []
+
+    for page in selected_pages:
+        page_number = page.get("page_number")
+
+        if page_number is None:
+            page_number = page.get("page", -1)
+
+        text = page.get("text", "")
+
+        context.append(
+            f"--- PDF Page {page_number} ---\n{text}"
+        )
+
+    return "\n\n".join(context)
+
+
+def _refine_answer(llm, answer, pdf_context):
+    structured_llm = llm.with_structured_output(
+        ExtractionResponse
+    )
+
+    messages = [
+        SystemMessage(content=REFINEMENT_PROMPT),
+        HumanMessage(
+            content=f"""
+Existing candidate:
+
+{answer}
+
+PDF evidence:
+
+{pdf_context}
+"""
+        ),
+    ]
+
+    response = structured_llm.invoke(messages)
+
+    if not response.answers:
+        return answer.copy()
+
+    candidate = response.answers[0].model_dump()
+
+    # Preserve the original template schema.
+    candidate["worksheet"] = answer.get(
+        "worksheet",
+        "",
+    )
+    candidate["variable"] = answer.get(
+        "variable",
+        "",
+    )
+
+    return candidate
+
+
+def _verify_answer(llm, answer, pdf_context):
+    structured_llm = llm.with_structured_output(
+        VerificationResponse
+    )
+
+    messages = [
+        SystemMessage(content=VERIFICATION_PROMPT),
+        HumanMessage(
+            content=f"""
+Candidate extraction:
+
+{answer}
+
+PDF evidence:
+
+{pdf_context}
+"""
+        ),
+    ]
+
+    response = structured_llm.invoke(messages)
+
+    if not response.results:
+        return {
+            "worksheet": answer.get("worksheet", ""),
+            "variable": answer.get("variable", ""),
+            "is_correct": False,
+            "verification_confidence": 0.0,
+            "verified_value": "N/A",
+            "page_number": -1,
+            "source_fields": [],
+            "formula": None,
+            "reason": "Verification returned no result.",
+        }
+
+    result = response.results[0].model_dump()
+
+    # Keep worksheet context even if VerificationResult
+    # does not define a worksheet field.
+    result["worksheet"] = answer.get(
+        "worksheet",
+        "",
+    )
+    result["variable"] = answer.get(
+        "variable",
+        result.get("variable", ""),
+    )
+
+    return result
+
+
+def confidence_refinement(
+    state: FinancialGraphState,
+) -> dict:
+    answers = state.get("answers", [])
+    attempts = state.get(
+        "refinement_attempts",
+        0,
+    )
+
+    original_answers = state.get(
+        "original_answers"
+    )
+
+    if original_answers is None:
+        original_answers = [
+            answer.copy()
+            for answer in answers
+        ]
+
+    llm = state.get("llm")
+
+    if llm is None:
+        raise ValueError(
+            "LLM is missing from graph state"
+        )
+
+    selected_pages = state.get(
+        "selected_pages",
+        [],
+    )
+
+    pdf_context = _build_pdf_context(
+        selected_pages
+    )
+
+    # Keep previous refined candidates,
+    # but verify only the current pass.
+    refined_answers = state.get(
+        "refined_answers",
+        [],
+    )
+
+    refined_by_metric = {
+        (
+            answer.get("worksheet", ""),
+            answer.get("variable", ""),
+        ): answer
+        for answer in refined_answers
+    }
+
+    # IMPORTANT:
+    # Start fresh for every refinement pass.
+    verification_by_metric = {}
+
+    current_answers = []
+
+    for answer in answers:
+        worksheet = answer.get(
+            "worksheet",
+            "",
+        )
+        variable = answer.get(
+            "variable",
+            "",
+        )
+
+        metric_key = (
+            worksheet,
+            variable,
+        )
+
+        # First verify the current answer.
+        original_verification = _verify_answer(
+            llm,
+            answer,
+            pdf_context,
+        )
+
+        if original_verification.get(
+            "is_correct",
+            False,
+        ):
+            verification_by_metric[
+                metric_key
+            ] = original_verification
+
+            current_answers.append(
+                answer.copy()
+            )
+            continue
+
+        # Verification failed.
+        # Refinement is now required regardless of confidence.
+        confidence = float(
+            answer.get(
+                "confidence",
+                0.0,
+            )
+        )
+
+        should_refine = (
+            confidence < REFINEMENT_CONFIDENCE_THRESHOLD
+            or not original_verification.get(
+                "is_correct",
+                False,
+            )
+        )
+
+        if should_refine:
+            candidate = _refine_answer(
+                llm,
+                answer,
+                pdf_context,
+            )
+        else:
+            candidate = answer.copy()
+
+        # Preserve template identity.
+        candidate["worksheet"] = worksheet
+        candidate["variable"] = variable
+
+        refined_by_metric[
+            metric_key
+        ] = candidate
+
+        # Verify the refined candidate.
+        refined_verification = _verify_answer(
+            llm,
+            candidate,
+            pdf_context,
+        )
+
+        verification_by_metric[
+            metric_key
+        ] = refined_verification
+
+        if refined_verification.get(
+            "is_correct",
+            False,
+        ):
+            # Use refined answer only when verified.
+            current_answers.append(
+                candidate.copy()
+            )
+        else:
+            # Keep the current/original answer when
+            # refinement is not verified.
+            current_answers.append(
+                answer.copy()
+            )
+
+    return {
+        "answers": current_answers,
+        "original_answers": original_answers,
+        "refined_answers": list(
+            refined_by_metric.values()
+        ),
+        "verification_results": list(
+            verification_by_metric.values()
+        ),
+        "refinement_attempts": attempts + 1,
+    }
+
+
+def route_after_refinement(
+    state: FinancialGraphState,
+) -> str:
+    attempts = state.get(
+        "refinement_attempts",
+        0,
+    )
+
+    verification_results = state.get(
+        "verification_results",
+        [],
+    )
+
+    # Always stop when maximum attempts are reached.
+    if attempts >= MAX_REFINEMENT_ATTEMPTS:
+        return "continue"
+
+    # Nothing to verify.
+    if not verification_results:
+        return "continue"
+
+    all_verified = all(
+        result.get("is_correct", False)
+        for result in verification_results
+    )
+
+    if all_verified:
+        return "continue"
+
+    return "refine"
+```
