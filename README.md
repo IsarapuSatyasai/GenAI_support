@@ -1,28 +1,5 @@
-```text
-test/financial-spreading-refinement
-```
-
-```text
-Add original vs refined comparison sheet
-```
-
-```python
-Added a Comparison worksheet to the financial spreading Excel output.
-
-The new sheet compares the original extracted answers with the final
-answers after refinement and verification. It includes answer,
-confidence, page number, source fields, formula, source link, and a
-changed indicator.
-
-All metrics from the Excel template are retained in the comparison,
-including metrics with N/A or missing values. Existing output
-worksheets remain unchanged.
-```
-
 ```python
 """Create template-aligned Excel output."""
-
-import os
 
 import pandas as pd
 
@@ -87,12 +64,12 @@ def align_answers_to_template(
     return aligned
 
 
-def build_comparison_dataframe(
+def build_comparison_dataframes(
     excel_data,
     original_answers,
     final_answers,
 ):
-    """Create original and refined answer comparison."""
+    """Create original and refined comparison worksheets."""
 
     original_map = {
         (
@@ -110,11 +87,13 @@ def build_comparison_dataframe(
         for answer in final_answers
     }
 
-    comparison = []
+    comparison_data = {}
 
     for metric in excel_data:
+        worksheet = metric["worksheet"]
+
         key = (
-            metric["worksheet"],
+            worksheet,
             metric["variable"],
         )
 
@@ -196,27 +175,32 @@ def build_comparison_dataframe(
             or original_source_link != refined_source_link
         )
 
-        comparison.append(
-            {
-                "worksheet": metric["worksheet"],
-                "variable": metric["variable"],
-                "answer_original": original_answer,
-                "answer_refined": refined_answer,
-                "confidence_original": original_confidence,
-                "confidence_refined": refined_confidence,
-                "page_number_original": original_page,
-                "page_number_refined": refined_page,
-                "source_fields_original": original_source_fields,
-                "source_fields_refined": refined_source_fields,
-                "formula_original": original_formula,
-                "formula_refined": refined_formula,
-                "source_link_original": original_source_link,
-                "source_link_refined": refined_source_link,
-                "changed": changed,
-            }
-        )
+        row = {
+            "variable": metric["variable"],
+            "answer_original": original_answer,
+            "answer_refined": refined_answer,
+            "confidence_original": original_confidence,
+            "confidence_refined": refined_confidence,
+            "page_number_original": original_page,
+            "page_number_refined": refined_page,
+            "source_fields_original": original_source_fields,
+            "source_fields_refined": refined_source_fields,
+            "formula_original": original_formula,
+            "formula_refined": refined_formula,
+            "source_link_original": original_source_link,
+            "source_link_refined": refined_source_link,
+            "changed": changed,
+        }
 
-    return pd.DataFrame(comparison)
+        comparison_data.setdefault(
+            worksheet,
+            [],
+        ).append(row)
+
+    return {
+        worksheet: pd.DataFrame(rows)
+        for worksheet, rows in comparison_data.items()
+    }
 
 
 def create_excel_output(
@@ -252,10 +236,13 @@ def create_excel_output(
     if not excel_data:
         return {
             "output_excel": "",
+            "comparison_excel": "",
             "errors": state.get(
                 "errors",
                 [],
-            ) + ["No template metrics available for Excel output."],
+            ) + [
+                "No template metrics available for Excel output."
+            ],
         }
 
     if not answers:
@@ -317,15 +304,11 @@ def create_excel_output(
         for worksheet, rows in worksheet_dict.items()
     }
 
-    comparison_df = build_comparison_dataframe(
+    comparison_dict = build_comparison_dataframes(
         excel_data,
         original_answers,
         answers,
     )
-
-    comparison_dict = {
-        "Comparison": comparison_df,
-    }
 
     try:
         print(
@@ -346,6 +329,11 @@ def create_excel_output(
 
         print(
             f"Worksheets: {list(worksheet_dict.keys())}"
+        )
+
+        print(
+            f"Comparison worksheets: "
+            f"{list(comparison_dict.keys())}"
         )
 
         status = excel_write(
@@ -380,5 +368,4 @@ def create_excel_output(
                 [],
             ) + [error],
         }
-
 ```
