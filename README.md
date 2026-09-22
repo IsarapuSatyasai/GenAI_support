@@ -1,371 +1,227 @@
 ```python
-"""Create template-aligned Excel output."""
-
-import pandas as pd
-
-from graph.graph_state import FinancialGraphState
-from template.excel_writer import excel_write
+"""Prompts used for financial metric refinement."""
 
 
-def align_answers_to_template(
-    excel_data,
-    answers,
-):
-    """Ensure final output contains exactly template metrics."""
+REFINEMENT_SYSTEM_PROMPT = """
+You are a senior financial-spreading verification analyst.
 
-    answer_map = {
-        (
-            answer["worksheet"],
-            answer["variable"],
-        ): answer
-        for answer in answers
-    }
+Your task is to REVIEW and IMPROVE an existing financial extraction.
 
-    aligned = []
+You are NOT performing a new extraction of the document.
 
-    for metric in excel_data:
-        key = (
-            metric["worksheet"],
-            metric["variable"],
+The Excel template is the authoritative source for the list of metrics.
+
+NON-NEGOTIABLE RULES:
+
+1. Only refine metrics that already exist in the provided template.
+
+2. NEVER create a new metric.
+
+3. NEVER rename a metric.
+
+4. NEVER change the worksheet name.
+
+5. NEVER add a metric that is not present in the template.
+
+6. NEVER remove a metric that exists in the template.
+
+7. The existing answer is the starting point.
+   Your task is to check whether it is correct and improve it only
+   when the PDF evidence supports an improvement.
+
+8. Use the provided PDF pages as evidence.
+
+9. Verify:
+   - answer/value
+   - metric mapping
+   - worksheet
+   - page number
+   - source fields
+   - formula
+   - financial period
+
+10. For the first report metadata worksheet, categorical values are
+    allowed.
+
+11. For all other worksheets, financial metric answers are expected
+    to represent numerical values unless the template or source
+    explicitly indicates otherwise.
+
+12. For numerical worksheets, carefully inspect the existing answer
+    for unexpected characters or malformed numerical values.
+
+    A numerical answer may contain normal numerical formatting such as:
+    - digits
+    - commas
+    - decimal points
+    - negative signs
+
+    Other characters may be valid only when they are explicitly supported
+    by the template, remarks, or source context.
+
+13. If a numerical answer contains unexpected alphabetic or special
+    characters, such as "?", "x", or other characters that do not
+    appear to belong to the numerical value, treat the answer as a
+    potential extraction error.
+
+14. When a potentially malformed numerical value is detected, do not
+    simply preserve it because the original answer has a high confidence.
+
+    Re-check the relevant PDF evidence, including the surrounding
+    context, source field, page, financial period, and nearby values,
+    to determine the actual value.
+
+15. If the PDF clearly supports a corrected numerical value, replace
+    the malformed or incorrect answer with the value supported by the
+    PDF.
+
+16. Do not make corrections based only on assumptions or formatting
+    preferences. A corrected value must be supported by the PDF evidence.
+
+17. If the original answer is correct and sufficiently supported,
+    keep it unchanged.
+
+18. If the original answer is incorrect, replace it only with a
+    value directly supported by the provided PDF evidence.
+
+19. Do not guess or infer unsupported values.
+
+20. If the metric cannot be verified or found in the provided PDF,
+    return:
+        answer = "N/A"
+        confidence = 0.0
+        page_number = -1
+        source_fields = []
+        formula = null
+        is_supported = false
+
+21. The string "N/A" must be used instead of null, blank, or omission
+    when a metric is unavailable.
+
+22. Return exactly one result for every metric supplied for refinement.
+
+23. Preserve the exact worksheet and variable names supplied by the
+    template.
+
+24. A refinement is an improvement only when it is supported by
+    evidence from the PDF.
+
+25. Do not change an answer merely to make it look different.
+
+26. If the original answer is already correct, retain it.
+
+27. Maximum refinement attempts are controlled by the application.
+    You only perform the current requested refinement attempt.
+
+OUTPUT:
+
+Return only the structured response matching RefinementResponse.
+"""
+
+
+def build_refinement_prompt(metrics, pdf_context, attempt):
+    """Build the prompt for one refinement attempt."""
+
+    metrics_text = []
+
+    for metric in metrics:
+        metrics_text.append(
+            f"""
+Worksheet: {metric["worksheet"]}
+Variable: {metric["variable"]}
+Description: {metric.get("description", "")}
+Template Formula: {metric.get("formula")}
+Template Remarks: {metric.get("remarks")}
+
+Existing Answer:
+{metric.get("answer", "N/A")}
+
+Existing Confidence:
+{metric.get("confidence", 0.0)}
+
+Existing Page:
+{metric.get("page_number", -1)}
+
+Existing Source Fields:
+{metric.get("source_fields", [])}
+"""
         )
 
-        answer = answer_map.get(key, {})
+    return f"""
+REFINEMENT ATTEMPT: {attempt}
 
-        aligned.append(
-            {
-                "worksheet": metric["worksheet"],
-                "variable": metric["variable"],
-                "answer": answer.get(
-                    "answer",
-                    "N/A",
-                ),
-                "confidence": answer.get(
-                    "confidence",
-                    0.0,
-                ),
-                "page_number": answer.get(
-                    "page_number",
-                    -1,
-                ),
-                "source_fields": answer.get(
-                    "source_fields",
-                    [],
-                ),
-                "formula": answer.get(
-                    "formula",
-                ),
-                "source_link": answer.get(
-                    "source_link",
-                    "N/A",
-                ),
-            }
-        )
+Review the following existing metric answers against the supplied
+PDF evidence.
 
-    return aligned
+IMPORTANT:
+These metrics already come from the Excel template.
 
+Do not create, remove, rename, or restructure metrics.
 
-def build_comparison_dataframes(
-    excel_data,
-    original_answers,
-    final_answers,
-):
-    """Create original and refined comparison worksheets."""
+Your task is to improve the existing answer only when the PDF
+provides stronger evidence.
 
-    original_map = {
-        (
-            answer["worksheet"],
-            answer["variable"],
-        ): answer
-        for answer in original_answers
-    }
+NUMERICAL VALUE VALIDATION:
 
-    final_map = {
-        (
-            answer["worksheet"],
-            answer["variable"],
-        ): answer
-        for answer in final_answers
-    }
+For the first report metadata worksheet, categorical values are allowed.
 
-    comparison_data = {}
+For all other worksheets, carefully check whether the existing answer
+looks like a valid numerical financial value.
 
-    for metric in excel_data:
-        worksheet = metric["worksheet"]
+Pay special attention to answers containing unexpected characters,
+including question marks, alphabetic characters, or other characters
+that do not normally belong to a numerical value.
 
-        key = (
-            worksheet,
-            metric["variable"],
-        )
+Normal numerical formatting may include digits, commas, decimal points,
+and negative signs. Other characters should only be retained when they
+are explicitly supported by the template or PDF context.
 
-        original = original_map.get(
-            key,
-            {},
-        )
+If an answer looks malformed or contains an unexpected character:
 
-        final = final_map.get(
-            key,
-            {},
-        )
+1. Treat it as a potential extraction error.
+2. Re-check the relevant PDF evidence.
+3. Check the surrounding text and source field.
+4. Check the financial period.
+5. Determine the actual value shown in the PDF.
+6. Replace the malformed answer only if the PDF supports the correction.
+7. Do not invent or infer a value that is not supported by the PDF.
 
-        original_answer = original.get(
-            "answer",
-            "N/A",
-        )
+Do not assume that a high existing confidence means the value is correct.
+A malformed numerical value must still be investigated.
 
-        refined_answer = final.get(
-            "answer",
-            original_answer,
-        )
+If the existing numerical answer is valid, correctly mapped, and
+supported by the PDF, keep it unchanged.
 
-        original_confidence = original.get(
-            "confidence",
-            0.0,
-        )
+EXISTING METRICS:
 
-        refined_confidence = final.get(
-            "confidence",
-            original_confidence,
-        )
+{"".join(metrics_text)}
 
-        original_page = original.get(
-            "page_number",
-            -1,
-        )
+PDF EVIDENCE:
 
-        refined_page = final.get(
-            "page_number",
-            original_page,
-        )
+{pdf_context}
 
-        original_source_fields = original.get(
-            "source_fields",
-            [],
-        )
+For every supplied metric:
 
-        refined_source_fields = final.get(
-            "source_fields",
-            original_source_fields,
-        )
+1. Check the existing answer.
+2. Check whether the answer has the expected value type for its worksheet.
+3. Check for unexpected or malformed characters.
+4. Check the page number.
+5. Check the source field mapping.
+6. Check the financial period.
+7. Check whether the value is supported by the PDF.
+8. If a numerical value looks malformed, re-check the PDF and correct it
+   when the source clearly supports a different value.
+9. Correct the answer only when necessary and supported by evidence.
+10. If unsupported or unavailable, return N/A.
+"""
+```
 
-        original_formula = original.get(
-            "formula",
-        )
+```text
+Improve refinement prompt with numerical value validation
 
-        refined_formula = final.get(
-            "formula",
-            original_formula,
-        )
-
-        original_source_link = original.get(
-            "source_link",
-            "N/A",
-        )
-
-        refined_source_link = final.get(
-            "source_link",
-            original_source_link,
-        )
-
-        changed = (
-            original_answer != refined_answer
-            or original_confidence != refined_confidence
-            or original_page != refined_page
-            or original_source_fields != refined_source_fields
-            or original_formula != refined_formula
-            or original_source_link != refined_source_link
-        )
-
-        row = {
-            "variable": metric["variable"],
-            "answer_original": original_answer,
-            "answer_refined": refined_answer,
-            "confidence_original": original_confidence,
-            "confidence_refined": refined_confidence,
-            "page_number_original": original_page,
-            "page_number_refined": refined_page,
-            "source_fields_original": original_source_fields,
-            "source_fields_refined": refined_source_fields,
-            "formula_original": original_formula,
-            "formula_refined": refined_formula,
-            "source_link_original": original_source_link,
-            "source_link_refined": refined_source_link,
-            "changed": changed,
-        }
-
-        comparison_data.setdefault(
-            worksheet,
-            [],
-        ).append(row)
-
-    return {
-        worksheet: pd.DataFrame(rows)
-        for worksheet, rows in comparison_data.items()
-    }
-
-
-def create_excel_output(
-    state: FinancialGraphState,
-):
-    """Create Excel output using template-defined metrics."""
-
-    excel_data = state.get(
-        "excel_data",
-        [],
-    )
-
-    original_answers = state.get(
-        "original_answers",
-        [],
-    )
-
-    answers = state.get(
-        "answers",
-        [],
-    )
-
-    output_path = state.get(
-        "output_path",
-        "",
-    )
-
-    pdf_file_name = state.get(
-        "pdf_file_name",
-        "",
-    )
-
-    if not excel_data:
-        return {
-            "output_excel": "",
-            "comparison_excel": "",
-            "errors": state.get(
-                "errors",
-                [],
-            ) + [
-                "No template metrics available for Excel output."
-            ],
-        }
-
-    if not answers:
-        answers = []
-
-    output_name = (
-        pdf_file_name.removeprefix(
-            "InputData"
-        ).removesuffix(
-            ".pdf"
-        )
-        + ".xlsx"
-    )
-
-    output_excel = (
-        output_path.rstrip("/")
-        + "/"
-        + output_name
-    )
-
-    comparison_name = (
-        pdf_file_name.removeprefix(
-            "InputData"
-        ).removesuffix(
-            ".pdf"
-        )
-        + "-comparison.xlsx"
-    )
-
-    comparison_excel = (
-        output_path.rstrip("/")
-        + "/"
-        + comparison_name
-    )
-
-    aligned_answers = align_answers_to_template(
-        excel_data,
-        answers,
-    )
-
-    worksheet_dict = {}
-
-    for answer in aligned_answers:
-        worksheet = answer["worksheet"]
-
-        row = {
-            key: value
-            for key, value in answer.items()
-            if key != "worksheet"
-        }
-
-        worksheet_dict.setdefault(
-            worksheet,
-            [],
-        ).append(row)
-
-    worksheet_dict = {
-        worksheet: pd.DataFrame(rows)
-        for worksheet, rows in worksheet_dict.items()
-    }
-
-    comparison_dict = build_comparison_dataframes(
-        excel_data,
-        original_answers,
-        answers,
-    )
-
-    try:
-        print(
-            f"Creating Excel output: {output_excel}"
-        )
-
-        print(
-            f"Creating comparison output: {comparison_excel}"
-        )
-
-        print(
-            f"Template metrics: {len(excel_data)}"
-        )
-
-        print(
-            f"Final answers: {len(aligned_answers)}"
-        )
-
-        print(
-            f"Worksheets: {list(worksheet_dict.keys())}"
-        )
-
-        print(
-            f"Comparison worksheets: "
-            f"{list(comparison_dict.keys())}"
-        )
-
-        status = excel_write(
-            dataframes=worksheet_dict,
-            output_path=output_excel,
-        )
-
-        comparison_status = excel_write(
-            dataframes=comparison_dict,
-            output_path=comparison_excel,
-        )
-
-        return {
-            "output_excel": status,
-            "comparison_excel": comparison_status,
-            "errors": state.get(
-                "errors",
-                [],
-            ),
-        }
-
-    except Exception as exc:
-        error = f"Error writing excel file: {exc}"
-
-        print(error)
-
-        return {
-            "output_excel": "",
-            "comparison_excel": "",
-            "errors": state.get(
-                "errors",
-                [],
-            ) + [error],
-        }
+- Add validation for malformed numerical values
+- Detect unexpected characters such as "?" and alphabetic characters
+- Instruct refinement to re-check PDF evidence before correcting values
+- Preserve valid numerical values when already supported
+- Generalize validation beyond specific metrics or lines
 ```
