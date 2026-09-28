@@ -9,23 +9,135 @@ refinement_attempts = 0
 ```
 
 ```python
+    def confidence_refinement(
+    state: FinancialGraphState,
+) -> dict:
+    """Run the configured number of refinement attempts."""
+
     settings = get_settings()
 
-    original_answers = state.get(
-        "original_answers",
-        [],
-    )
+    # Skip refinement when attempts are set to zero.
+    if settings.refinement_attempts <= 0:
+        original_answers = state.get("original_answers", [])
 
-    if settings.refinement_attempts == 0:
         return {
             "answers": original_answers,
             "refined_answers": [],
             "refinement_attempt": 0,
-            "errors": state.get(
-                "errors",
-                [],
-            ),
+            "errors": state.get("errors", []),
         }
+
+    llm = state.get("llm")
+
+    if llm is None:
+        return {
+            "answers": state.get("original_answers", []),
+            "refined_answers": [],
+            "errors": state.get("errors", []) + [
+                "LLM not available for refinement."
+            ],
+        }
+
+    excel_data = state.get("excel_data", [])
+    original_answers = state.get("original_answers", [])
+    selected_pages = state.get("selected_pages", [])
+
+    source_link = (
+        settings.sharepoint_link
+        + state.get("pdf_file_name", "").replace(" ", "%20")
+    )
+
+    metrics = _select_metrics_for_refinement(
+        excel_data,
+        original_answers,
+    )
+
+    if not metrics:
+        return {
+            "answers": original_answers,
+            "refined_answers": [],
+            "refinement_attempt": 0,
+        }
+
+    pdf_context = _build_pdf_context(selected_pages)
+
+    current_answers = metrics
+    all_refined_answers = []
+
+    for attempt in range(1, settings.refinement_attempts + 1):
+        prompt = build_refinement_prompt(
+            current_answers,
+            pdf_context,
+            attempt,
+        )
+
+        messages = [
+            SystemMessage(
+                content=REFINEMENT_SYSTEM_PROMPT
+            ),
+            HumanMessage(content=prompt),
+        ]
+
+        try:
+            structured_llm = llm.with_structured_output(
+                RefinementResponse
+            )
+
+            response = structured_llm.invoke(messages)
+
+        except Exception as exc:
+            error = (
+                f"Refinement attempt {attempt} failed: {exc}"
+            )
+
+            return {
+                "answers": state.get(
+                    "original_answers",
+                    [],
+                ),
+                "refined_answers": all_refined_answers,
+                "refinement_attempt": attempt,
+                "errors": state.get(
+                    "errors",
+                    [],
+                ) + [error],
+            }
+
+        refined = [
+            _normalize_answer(
+                answer.model_dump(),
+                source_link,
+            )
+            for answer in response.answers
+        ]
+
+        all_refined_answers.extend(refined)
+
+        current_answers = [
+            {
+                **metric,
+                **refined_answer,
+            }
+            for metric in metrics
+            for refined_answer in refined
+            if _metric_key(metric)
+            == _metric_key(refined_answer)
+        ]
+
+        metrics = current_answers
+
+    final_answers = _merge_refined_answers(
+        excel_data,
+        original_answers,
+        all_refined_answers,
+    )
+
+    return {
+        "answers": final_answers,
+        "refined_answers": all_refined_answers,
+        "refinement_attempt": settings.refinement_attempts,
+        "errors": state.get("errors", []),
+    }
 ```
 
 ```python
