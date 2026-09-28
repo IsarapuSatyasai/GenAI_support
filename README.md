@@ -1,227 +1,252 @@
 ```python
-"""Prompts used for financial metric refinement."""
+# --- Page selection ---
+first_n_pages = 5
+page_score_threshold = 1
+min_pages = 30
 
+# --- Refinement ---
+refinement_attempts = 0
+```
 
-REFINEMENT_SYSTEM_PROMPT = """
-You are a senior financial-spreading verification analyst.
+```python
+    settings = get_settings()
 
-Your task is to REVIEW and IMPROVE an existing financial extraction.
+    original_answers = state.get(
+        "original_answers",
+        [],
+    )
 
-You are NOT performing a new extraction of the document.
+    if settings.refinement_attempts == 0:
+        return {
+            "answers": original_answers,
+            "refined_answers": [],
+            "refinement_attempt": 0,
+            "errors": state.get(
+                "errors",
+                [],
+            ),
+        }
+```
 
-The Excel template is the authoritative source for the list of metrics.
+```python
+for attempt in range(
+    1,
+    settings.refinement_attempts + 1,
+):
+```
 
-NON-NEGOTIABLE RULES:
+```python
+from prompts.selected_keywords import (
+    page_relevance_score,
+    page_score,
+)
+```
 
-1. Only refine metrics that already exist in the provided template.
+```python
+def select_pages(state: FinancialGraphState) -> dict:
+    """Select relevant pages using weighted page scoring."""
 
-2. NEVER create a new metric.
+    settings = get_settings()
 
-3. NEVER rename a metric.
+    pdf_pages = state.get("pdf_pages", [])
+    n = settings.first_n_pages
 
-4. NEVER change the worksheet name.
+    selected_pages = []
 
-5. NEVER add a metric that is not present in the template.
+    # Keep the first N pages as initial candidates.
+    for page in pdf_pages[:n]:
+        selected_pages.append(page)
 
-6. NEVER remove a metric that exists in the template.
+    # Use existing keyword matching to create candidates.
+    for page in pdf_pages[n:]:
+        page_text = page.get("text", "")
 
-7. The existing answer is the starting point.
-   Your task is to check whether it is correct and improve it only
-   when the PDF evidence supports an improvement.
+        if page_score(page_text) > settings.page_score_threshold:
+            selected_pages.append(page)
 
-8. Use the provided PDF pages as evidence.
+    # Score candidate pages using additional signals.
+    scored_pages = []
 
-9. Verify:
-   - answer/value
-   - metric mapping
-   - worksheet
-   - page number
-   - source fields
-   - formula
-   - financial period
-
-10. For the first report metadata worksheet, categorical values are
-    allowed.
-
-11. For all other worksheets, financial metric answers are expected
-    to represent numerical values unless the template or source
-    explicitly indicates otherwise.
-
-12. For numerical worksheets, carefully inspect the existing answer
-    for unexpected characters or malformed numerical values.
-
-    A numerical answer may contain normal numerical formatting such as:
-    - digits
-    - commas
-    - decimal points
-    - negative signs
-
-    Other characters may be valid only when they are explicitly supported
-    by the template, remarks, or source context.
-
-13. If a numerical answer contains unexpected alphabetic or special
-    characters, such as "?", "x", or other characters that do not
-    appear to belong to the numerical value, treat the answer as a
-    potential extraction error.
-
-14. When a potentially malformed numerical value is detected, do not
-    simply preserve it because the original answer has a high confidence.
-
-    Re-check the relevant PDF evidence, including the surrounding
-    context, source field, page, financial period, and nearby values,
-    to determine the actual value.
-
-15. If the PDF clearly supports a corrected numerical value, replace
-    the malformed or incorrect answer with the value supported by the
-    PDF.
-
-16. Do not make corrections based only on assumptions or formatting
-    preferences. A corrected value must be supported by the PDF evidence.
-
-17. If the original answer is correct and sufficiently supported,
-    keep it unchanged.
-
-18. If the original answer is incorrect, replace it only with a
-    value directly supported by the provided PDF evidence.
-
-19. Do not guess or infer unsupported values.
-
-20. If the metric cannot be verified or found in the provided PDF,
-    return:
-        answer = "N/A"
-        confidence = 0.0
-        page_number = -1
-        source_fields = []
-        formula = null
-        is_supported = false
-
-21. The string "N/A" must be used instead of null, blank, or omission
-    when a metric is unavailable.
-
-22. Return exactly one result for every metric supplied for refinement.
-
-23. Preserve the exact worksheet and variable names supplied by the
-    template.
-
-24. A refinement is an improvement only when it is supported by
-    evidence from the PDF.
-
-25. Do not change an answer merely to make it look different.
-
-26. If the original answer is already correct, retain it.
-
-27. Maximum refinement attempts are controlled by the application.
-    You only perform the current requested refinement attempt.
-
-OUTPUT:
-
-Return only the structured response matching RefinementResponse.
-"""
-
-
-def build_refinement_prompt(metrics, pdf_context, attempt):
-    """Build the prompt for one refinement attempt."""
-
-    metrics_text = []
-
-    for metric in metrics:
-        metrics_text.append(
-            f"""
-Worksheet: {metric["worksheet"]}
-Variable: {metric["variable"]}
-Description: {metric.get("description", "")}
-Template Formula: {metric.get("formula")}
-Template Remarks: {metric.get("remarks")}
-
-Existing Answer:
-{metric.get("answer", "N/A")}
-
-Existing Confidence:
-{metric.get("confidence", 0.0)}
-
-Existing Page:
-{metric.get("page_number", -1)}
-
-Existing Source Fields:
-{metric.get("source_fields", [])}
-"""
+    for page in selected_pages:
+        signals = page_relevance_score(
+            page.get("text", "")
         )
 
-    return f"""
-REFINEMENT ATTEMPT: {attempt}
+        scored_page = dict(page)
+        scored_page["page_relevance_score"] = signals["score"]
 
-Review the following existing metric answers against the supplied
-PDF evidence.
+        scored_pages.append(scored_page)
 
-IMPORTANT:
-These metrics already come from the Excel template.
+    # Rank pages by relevance.
+    scored_pages.sort(
+        key=lambda page: page["page_relevance_score"],
+        reverse=True,
+    )
 
-Do not create, remove, rename, or restructure metrics.
+    # Keep the existing behavior for small PDFs.
+    if len(pdf_pages) < settings.min_pages:
+        scored_pages = pdf_pages
 
-Your task is to improve the existing answer only when the PDF
-provides stronger evidence.
+    return {
+        "selected_pages": scored_pages,
+        "errors": state.get("errors", []),
+    }
+```
 
-NUMERICAL VALUE VALIDATION:
+```python
+import re
 
-For the first report metadata worksheet, categorical values are allowed.
 
-For all other worksheets, carefully check whether the existing answer
-looks like a valid numerical financial value.
+FINANCIAL_TERMS = [
+    "balance sheet",
+    "statement of financial position",
+    "income statement",
+    "profit and loss",
+    "cash flow statement",
+    "financial statements",
+    "revenue",
+    "assets",
+    "liabilities",
+    "equity",
+]
 
-Pay special attention to answers containing unexpected characters,
-including question marks, alphabetic characters, or other characters
-that do not normally belong to a numerical value.
 
-Normal numerical formatting may include digits, commas, decimal points,
-and negative signs. Other characters should only be retained when they
-are explicitly supported by the template or PDF context.
+UNIT_TERMS = [
+    "in thousands",
+    "in millions",
+    "in billions",
+    "thousand",
+    "million",
+    "billion",
+    "€000",
+    "$000",
+]
 
-If an answer looks malformed or contains an unexpected character:
 
-1. Treat it as a potential extraction error.
-2. Re-check the relevant PDF evidence.
-3. Check the surrounding text and source field.
-4. Check the financial period.
-5. Determine the actual value shown in the PDF.
-6. Replace the malformed answer only if the PDF supports the correction.
-7. Do not invent or infer a value that is not supported by the PDF.
+def page_relevance_score(text: str) -> dict:
+    """Calculate relevance score for a financial page."""
 
-Do not assume that a high existing confidence means the value is correct.
-A malformed numerical value must still be investigated.
+    text_lower = text.lower()
 
-If the existing numerical answer is valid, correctly mapped, and
-supported by the PDF, keep it unchanged.
+    keyword_score = page_score(text)
 
-EXISTING METRICS:
+    year_score = len(
+        set(
+            re.findall(
+                r"\b(?:19|20)\d{2}\b",
+                text,
+            )
+        )
+    )
 
-{"".join(metrics_text)}
+    number_count = len(
+        re.findall(
+            r"(?<!\w)[(+-]?\d[\d,.]*(?!\w)",
+            text,
+        )
+    )
 
-PDF EVIDENCE:
+    word_count = max(
+        len(text.split()),
+        1,
+    )
 
-{pdf_context}
+    numeric_density = number_count / word_count
 
-For every supplied metric:
+    unit_score = sum(
+        term in text_lower
+        for term in UNIT_TERMS
+    )
 
-1. Check the existing answer.
-2. Check whether the answer has the expected value type for its worksheet.
-3. Check for unexpected or malformed characters.
-4. Check the page number.
-5. Check the source field mapping.
-6. Check the financial period.
-7. Check whether the value is supported by the PDF.
-8. If a numerical value looks malformed, re-check the PDF and correct it
-   when the source clearly supports a different value.
-9. Correct the answer only when necessary and supported by evidence.
-10. If unsupported or unavailable, return N/A.
-"""
+    financial_score = sum(
+        term in text_lower
+        for term in FINANCIAL_TERMS
+    )
+
+    score = (
+        keyword_score
+        + (year_score * 2)
+        + (numeric_density * 5)
+        + (unit_score * 2)
+        + (financial_score * 3)
+    )
+
+    return {
+        "score": round(score, 3),
+        "keyword_score": keyword_score,
+        "year_score": year_score,
+        "numeric_density": round(
+            numeric_density,
+            4,
+        ),
+        "unit_score": unit_score,
+        "financial_score": financial_score,
+    }
+```
+
+```python
+def build_page_selection_comparison(
+    excel_data,
+    baseline_pages,
+    improved_pages,
+):
+    """Compare baseline and improved selected PDF pages."""
+
+    baseline_numbers = {
+        page.get("page_number")
+        for page in baseline_pages
+    }
+
+    improved_numbers = {
+        page.get("page_number")
+        for page in improved_pages
+    }
+
+    rows = []
+
+    for page_number in sorted(
+        baseline_numbers | improved_numbers
+    ):
+        rows.append(
+            {
+                "page_number": page_number,
+                "baseline_selected": (
+                    "Yes"
+                    if page_number in baseline_numbers
+                    else "No"
+                ),
+                "improved_selected": (
+                    "Yes"
+                    if page_number in improved_numbers
+                    else "No"
+                ),
+                "changed": (
+                    page_number in baseline_numbers
+                )
+                != (
+                    page_number in improved_numbers
+                ),
+            }
+        )
+
+    return {
+        "Page Selection": pd.DataFrame(rows),
+    }
 ```
 
 ```text
-Improve refinement prompt with numerical value validation
+Add page selection comparison with refinement disabled
 
-- Add validation for malformed numerical values
-- Detect unexpected characters such as "?" and alphabetic characters
-- Instruct refinement to re-check PDF evidence before correcting values
-- Preserve valid numerical values when already supported
-- Generalize validation beyond specific metrics or lines
+```
+
+```text
+Implemented page-selection evaluation with refinement disabled.
+
+- Set refinement attempts to 0.
+- Added weighted page relevance scoring using financial terms, years, numeric density, and units.
+- Updated page selection to rank candidate pages by relevance.
+- Added baseline vs improved page-selection comparison output.
+- Kept the existing Excel template as the source of truth.
+- Preserved the existing extraction and refinement workflow.
+- Generated comparison results alongside the normal Excel output.
 ```
