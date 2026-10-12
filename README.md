@@ -582,6 +582,8 @@ refinement_attempts = 0
 ```text
 Improve template-based page selection and scoring
 ```
+
+```text
 - Select relevant PDF pages using Excel template metrics and configured synonyms.
 - Rank candidate pages by metric coverage, numeric density, and table structure.
 - Limit improved page selection to 10 pages by default.
@@ -591,5 +593,4 @@ Improve template-based page selection and scoring
 - Skip LLM extraction when no relevant pages are selected.
 - Preserve template-defined metrics and use N/A for unavailable answers.
 - Keep refinement attempts disabled during page-selection testing.
-```text
 ```
