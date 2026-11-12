@@ -1,7 +1,7 @@
 ```python
 """Node: RAG recovery for N/A metrics (batched, fixed-size chunk RAG).
 
-Creates a fresh unique collection on every run by copying the PDF
+Creates a fresh unique collection on every run by downloading the PDF
 to a temporary local path with a unique name.
 Uses the default fixed-size chunk RAG chain.
 source_fields are real PDF labels returned by the model (or empty list).
@@ -67,28 +67,32 @@ def _clean_json(raw: str) -> str:
 
 
 def _prepare_unique_local_source(pdf_source: str) -> str:
-    """Copy the PDF to a unique temporary local path."""
+    """Download the PDF to a unique temporary local path."""
     unique_suffix = uuid.uuid4().hex[:8]
     temp_dir = tempfile.mkdtemp(prefix=f"rag_{unique_suffix}_")
-    local_pdf = os.path.join(temp_dir, f"report_{unique_suffix}.pdf")
+
+    storage_account = "mscstagailtuprd03"
 
     try:
-        # Try using the existing download helper if the source is remote
-        from custom_lcel_components.downloadblob import download_file
-        download_file(pdf_source, local_pdf)
-        logger.info(f"Downloaded to unique local path: {local_pdf}")
-    except Exception:
-        # Fallback: if already local or download helper differs
-        if os.path.exists(pdf_source):
-            shutil.copy(pdf_source, local_pdf)
-            logger.info(f"Copied local file to unique path: {local_pdf}")
-        else:
-            raise RuntimeError(
-                f"Could not create local copy of {pdf_source}. "
-                "Adjust download_file import or provide a local path."
-            )
+        from custom_lcel_components.downloadblob import download_files_from_storage_account
 
-    return local_pdf
+        downloaded = download_files_from_storage_account(
+            cloud_path=pdf_source,
+            tmpdir=temp_dir,
+            storage_account=storage_account,
+        )
+        if not downloaded:
+            raise RuntimeError("Download returned no files")
+
+        original_local = downloaded[0]
+        unique_pdf = os.path.join(temp_dir, f"report_{unique_suffix}.pdf")
+        shutil.move(original_local, unique_pdf)
+        logger.info(f"Unique local source ready: {unique_pdf}")
+        return unique_pdf
+
+    except Exception as exc:
+        logger.exception("Failed to download unique local source")
+        raise RuntimeError(f"Could not prepare unique source for {pdf_source}: {exc}") from exc
 
 
 def rag_recovery(state: FinancialGraphState) -> dict:
@@ -114,7 +118,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics (fixed-size chunk RAG, batch size 3)")
     logger.info(f"rag_recovery: original pdf_source = {pdf_source}")
 
-    # Create unique local copy so collection name is always fresh and file exists
     try:
         unique_source = _prepare_unique_local_source(pdf_source)
     except Exception as exc:
@@ -190,7 +193,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
         try:
             raw = recovery_chain.invoke({
-                "source": unique_source,   # local unique path
+                "source": unique_source,
                 "question": "Extract the values for the listed metrics.",
                 "metrics_list": metrics_list,
             })
@@ -242,11 +245,13 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elif answers_by_year:
         answers_by_year[next(iter(answers_by_year))] = answers
 
-    # Optional cleanup of temp file
+    # Cleanup temp file
     try:
         if unique_source and os.path.exists(unique_source):
             os.remove(unique_source)
-            os.rmdir(os.path.dirname(unique_source))
+            parent = os.path.dirname(unique_source)
+            if os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
     except Exception:
         pass
 
