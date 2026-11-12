@@ -1,8 +1,9 @@
 ```python
 """Node: RAG recovery for N/A metrics (batched, fixed-size chunk RAG).
 
-Creates a fresh unique collection on every run (avoids reset issues).
-Uses the default fixed-size chunk RAG chain.
+Forces a fresh unique collection on every run by appending a random
+suffix to the source path (so derive_collection_name_from_source
+produces a new name). Uses the default fixed-size chunk RAG chain.
 source_fields are real PDF labels returned by the model (or empty list).
 """
 
@@ -83,18 +84,21 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         return {"use_rag": False}
 
     logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics (fixed-size chunk RAG, batch size 3)")
-    logger.info(f"rag_recovery: pdf_source = {pdf_source}")
+    logger.info(f"rag_recovery: original pdf_source = {pdf_source}")
 
-    # Always create a fresh unique collection name
-    base_name = derive_collection_name_from_source(
-        {"source": pdf_source}, source_key="source"
-    )
+    # Force a unique source so the derived collection name is always new
     unique_suffix = uuid.uuid4().hex[:8]
-    collection_name = f"{base_name}_{unique_suffix}"
-    # Keep within Chroma 63-char limit
-    if len(collection_name) > 63:
-        collection_name = collection_name[-63:]
-    logger.info(f"rag_recovery: using fresh collection '{collection_name}'")
+    unique_source = f"{pdf_source}#{unique_suffix}"
+    logger.info(f"rag_recovery: unique source = {unique_source}")
+
+    # Log the name that will actually be used
+    try:
+        collection_name = derive_collection_name_from_source(
+            {"source": unique_source}, source_key="source"
+        )
+        logger.info(f"rag_recovery: fresh collection name will be '{collection_name}'")
+    except Exception:
+        collection_name = None
 
     settings = get_settings()
 
@@ -127,11 +131,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             ("human", "Metrics to extract:\n{metrics_list}\n\nContext:\n{context}"),
         ])
 
-        # Force the unique collection name into the chain
         recovery_chain = (
-            RunnablePassthrough.assign(
-                collection_name=lambda _: collection_name
-            )
+            RunnablePassthrough.assign(collection_name=index_chain)
             | rag_chain
             | prompt
             | llm
@@ -159,8 +160,9 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         )
 
         try:
+            # Pass the unique source so the index step derives a new collection
             raw = recovery_chain.invoke({
-                "source": pdf_source,
+                "source": unique_source,
                 "question": "Extract the values for the listed metrics.",
                 "metrics_list": metrics_list,
             })
