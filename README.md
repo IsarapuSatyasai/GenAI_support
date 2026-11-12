@@ -1,9 +1,9 @@
 ```python
 """Node: RAG recovery for N/A metrics (batched, fixed-size chunk RAG).
 
-Forces a fresh unique collection on every run by appending a random
-suffix to the source path (so derive_collection_name_from_source
-produces a new name). Uses the default fixed-size chunk RAG chain.
+Creates a fresh unique collection on every run by copying the PDF
+to a temporary local path with a unique name.
+Uses the default fixed-size chunk RAG chain.
 source_fields are real PDF labels returned by the model (or empty list).
 """
 
@@ -13,6 +13,9 @@ import json
 import re
 import time
 import uuid
+import tempfile
+import os
+import shutil
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -63,6 +66,31 @@ def _clean_json(raw: str) -> str:
     return raw.strip()
 
 
+def _prepare_unique_local_source(pdf_source: str) -> str:
+    """Copy the PDF to a unique temporary local path."""
+    unique_suffix = uuid.uuid4().hex[:8]
+    temp_dir = tempfile.mkdtemp(prefix=f"rag_{unique_suffix}_")
+    local_pdf = os.path.join(temp_dir, f"report_{unique_suffix}.pdf")
+
+    try:
+        # Try using the existing download helper if the source is remote
+        from custom_lcel_components.downloadblob import download_file
+        download_file(pdf_source, local_pdf)
+        logger.info(f"Downloaded to unique local path: {local_pdf}")
+    except Exception:
+        # Fallback: if already local or download helper differs
+        if os.path.exists(pdf_source):
+            shutil.copy(pdf_source, local_pdf)
+            logger.info(f"Copied local file to unique path: {local_pdf}")
+        else:
+            raise RuntimeError(
+                f"Could not create local copy of {pdf_source}. "
+                "Adjust download_file import or provide a local path."
+            )
+
+    return local_pdf
+
+
 def rag_recovery(state: FinancialGraphState) -> dict:
     answers: List[Dict[str, Any]] = state.get("answers", [])
     answers_by_year: Dict[Any, List[Dict[str, Any]]] = state.get("answers_by_year", {})
@@ -86,17 +114,18 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics (fixed-size chunk RAG, batch size 3)")
     logger.info(f"rag_recovery: original pdf_source = {pdf_source}")
 
-    # Force a unique source so the derived collection name is always new
-    unique_suffix = uuid.uuid4().hex[:8]
-    unique_source = f"{pdf_source}#{unique_suffix}"
-    logger.info(f"rag_recovery: unique source = {unique_source}")
+    # Create unique local copy so collection name is always fresh and file exists
+    try:
+        unique_source = _prepare_unique_local_source(pdf_source)
+    except Exception as exc:
+        logger.exception("Failed to prepare unique local source")
+        return {"errors": errors + [f"Failed to prepare unique source: {exc}"]}
 
-    # Log the name that will actually be used
     try:
         collection_name = derive_collection_name_from_source(
             {"source": unique_source}, source_key="source"
         )
-        logger.info(f"rag_recovery: fresh collection name will be '{collection_name}'")
+        logger.info(f"rag_recovery: fresh collection name = '{collection_name}'")
     except Exception:
         collection_name = None
 
@@ -160,9 +189,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         )
 
         try:
-            # Pass the unique source so the index step derives a new collection
             raw = recovery_chain.invoke({
-                "source": unique_source,
+                "source": unique_source,   # local unique path
                 "question": "Extract the values for the listed metrics.",
                 "metrics_list": metrics_list,
             })
@@ -213,6 +241,14 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         answers_by_year[latest] = answers
     elif answers_by_year:
         answers_by_year[next(iter(answers_by_year))] = answers
+
+    # Optional cleanup of temp file
+    try:
+        if unique_source and os.path.exists(unique_source):
+            os.remove(unique_source)
+            os.rmdir(os.path.dirname(unique_source))
+    except Exception:
+        pass
 
     elapsed = time.time() - start_time
     logger.info(
