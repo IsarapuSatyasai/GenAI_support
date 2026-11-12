@@ -1,10 +1,9 @@
 ```python
-"""Node: RAG recovery for N/A metrics (batched, fixed-size chunk RAG).
+"""Node: RAG recovery for N/A metrics.
 
-Creates a fresh unique collection on every run by downloading the PDF
-to a temporary local path with a unique name.
-Uses the default fixed-size chunk RAG chain.
-source_fields are real PDF labels returned by the model (or empty list).
+Uses the already-selected pages from the graph state.
+No download, no vector store, no LlamaIndex.
+Batches N/A metrics and sends them with the page text to the LLM.
 """
 
 from typing import Any, Dict, List
@@ -12,17 +11,10 @@ import logging
 import json
 import re
 import time
-import uuid
-import tempfile
-import os
-import shutil
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 
-from custom_lcel_components.chains import get_default_rag_chain_from_config
-from custom_lcel_components.indexing import derive_collection_name_from_source
 from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
 from config import get_settings
@@ -30,7 +22,7 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a financial data extraction assistant.
-Given retrieved passages from an annual report, extract the exact numeric
+Given text from selected pages of an annual report, extract the exact numeric
 value (or exactly "N/A" if truly absent) for each requested metric.
 Return ONLY a valid JSON object.
 Each key is the exact variable name.
@@ -66,44 +58,30 @@ def _clean_json(raw: str) -> str:
     return raw.strip()
 
 
-def _prepare_unique_local_source(pdf_source: str) -> str:
-    """Download the PDF to a unique temporary local path."""
-    unique_suffix = uuid.uuid4().hex[:8]
-    temp_dir = tempfile.mkdtemp(prefix=f"rag_{unique_suffix}_")
-
-    storage_account = "mscstagailtuprd03"
-
-    try:
-        from custom_lcel_components.downloadblob import download_files_from_storage_account
-
-        downloaded = download_files_from_storage_account(
-            cloud_path=pdf_source,
-            tmpdir=temp_dir,
-            storage_account=storage_account,
-        )
-        if not downloaded:
-            raise RuntimeError("Download returned no files")
-
-        original_local = downloaded[0]
-        unique_pdf = os.path.join(temp_dir, f"report_{unique_suffix}.pdf")
-        shutil.move(original_local, unique_pdf)
-        logger.info(f"Unique local source ready: {unique_pdf}")
-        return unique_pdf
-
-    except Exception as exc:
-        logger.exception("Failed to download unique local source")
-        raise RuntimeError(f"Could not prepare unique source for {pdf_source}: {exc}") from exc
+def _build_page_context(selected_pages: List[Dict[str, Any]]) -> str:
+    """Build a single context string from already-selected pages."""
+    if not selected_pages:
+        return ""
+    parts = []
+    for page in selected_pages:
+        page_no = page.get("page_number") or page.get("page") or "?"
+        text = page.get("text") or page.get("content") or ""
+        parts.append(f"--- Page {page_no} ---\n{text}")
+    return "\n\n".join(parts)
 
 
 def rag_recovery(state: FinancialGraphState) -> dict:
     answers: List[Dict[str, Any]] = state.get("answers", [])
     answers_by_year: Dict[Any, List[Dict[str, Any]]] = state.get("answers_by_year", {})
     excel_data = state.get("excel_data", [])
-    pdf_source = state.get("pdf_source")
+    selected_pages = state.get("selected_pages", [])
     errors = list(state.get("errors", []))
 
-    if not pdf_source or not answers:
-        return {"errors": errors + ["rag_recovery skipped: missing pdf_source or answers"]}
+    if not answers:
+        return {"errors": errors + ["rag_recovery skipped: no answers"]}
+
+    if not selected_pages:
+        return {"errors": errors + ["rag_recovery skipped: no selected_pages"]}
 
     metric_lookup = {
         (m.get("worksheet"), m.get("variable")): m
@@ -115,64 +93,24 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         logger.info("rag_recovery: no N/A metrics to recover")
         return {"use_rag": False}
 
-    logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics (fixed-size chunk RAG, batch size 3)")
-    logger.info(f"rag_recovery: original pdf_source = {pdf_source}")
+    logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics from {len(selected_pages)} selected pages")
 
-    try:
-        unique_source = _prepare_unique_local_source(pdf_source)
-    except Exception as exc:
-        logger.exception("Failed to prepare unique local source")
-        return {"errors": errors + [f"Failed to prepare unique source: {exc}"]}
-
-    try:
-        collection_name = derive_collection_name_from_source(
-            {"source": unique_source}, source_key="source"
-        )
-        logger.info(f"rag_recovery: fresh collection name = '{collection_name}'")
-    except Exception:
-        collection_name = None
+    page_context = _build_page_context(selected_pages)
+    if not page_context.strip():
+        return {"errors": errors + ["rag_recovery skipped: selected pages have no text"]}
 
     settings = get_settings()
+    llm = create_llm(
+        azure_deployment=settings.azure_openai_deployment,
+        top_p=settings.llm_top_p,
+    ).with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
 
-    rag_config = {
-        "llm_model": settings.azure_openai_deployment,
-        "embedding_model_name": "text-embedding-3-large",
-        "pdf_loader_type": "PyMuPDFLoader",
-        "include_source": False,
-        "hybrid_search_args": None,
-        "remove_duplicate_chunks": True,
-        "chunk_size": 1024,
-        "chunk_overlap": 128,
-        "similarity_top_k": 20,
-        "source_key": "source",
-        "rerank_args": {"top_n": 10, "model": "cross-encoder/ms-marco-MiniLM-L-2-v2"},
-        "system_message": SYSTEM_PROMPT,
-        "top_p": settings.llm_top_p,
-    }
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", "Metrics to extract:\n{metrics_list}\n\nContext from selected pages:\n{context}"),
+    ])
 
-    try:
-        rag_chain, index_chain, _ = get_default_rag_chain_from_config(rag_config)
-
-        llm = create_llm(
-            azure_deployment=settings.azure_openai_deployment,
-            top_p=settings.llm_top_p,
-        ).with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            ("human", "Metrics to extract:\n{metrics_list}\n\nContext:\n{context}"),
-        ])
-
-        recovery_chain = (
-            RunnablePassthrough.assign(collection_name=index_chain)
-            | rag_chain
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-    except Exception as exc:
-        logger.exception("Failed to build RAG recovery chain")
-        return {"errors": errors + [f"Failed to build RAG recovery chain: {exc}"]}
+    chain = prompt | llm | StrOutputParser()
 
     BATCH_SIZE = 3
     recovered = 0
@@ -192,10 +130,9 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         )
 
         try:
-            raw = recovery_chain.invoke({
-                "source": unique_source,
-                "question": "Extract the values for the listed metrics.",
+            raw = chain.invoke({
                 "metrics_list": metrics_list,
+                "context": page_context,
             })
 
             cleaned = _clean_json(raw or "")
@@ -245,27 +182,17 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elif answers_by_year:
         answers_by_year[next(iter(answers_by_year))] = answers
 
-    # Cleanup temp file
-    try:
-        if unique_source and os.path.exists(unique_source):
-            os.remove(unique_source)
-            parent = os.path.dirname(unique_source)
-            if os.path.isdir(parent) and not os.listdir(parent):
-                os.rmdir(parent)
-    except Exception:
-        pass
-
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered}/{len(na_items)} "
-        f"in {elapsed:.1f}s (fixed-size chunk RAG, batch size {BATCH_SIZE})"
+        f"in {elapsed:.1f}s (selected-pages only, batch size {BATCH_SIZE})"
     )
 
     return {
         "answers": answers,
         "answers_by_year": answers_by_year,
         "errors": errors,
-        "rag_collection_name": collection_name,
         "use_rag": True,
+        "rag_collection_name": None,
     }
 ```
