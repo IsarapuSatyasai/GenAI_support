@@ -1,9 +1,8 @@
 ```python
 """Node: RAG recovery for N/A metrics.
 
-Uses the already-selected pages from the graph state.
-No download, no vector store, no LlamaIndex.
-Batches N/A metrics and sends them with the page text to the LLM.
+Builds an in-memory FAISS index from the already-selected pages.
+Retrieves top-k chunks per batch. No download, no persistent Chroma.
 """
 
 from typing import Any, Dict, List
@@ -14,15 +13,17 @@ import time
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
 
-from custom_lcel_components.llm import create_llm
+from custom_lcel_components.llm import create_llm, create_embedding_model
 from graph.graph_state import FinancialGraphState
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a financial data extraction assistant.
-Given text from selected pages of an annual report, extract the exact numeric
+Given retrieved passages from an annual report, extract the exact numeric
 value (or exactly "N/A" if truly absent) for each requested metric.
 Return ONLY a valid JSON object.
 Each key is the exact variable name.
@@ -58,16 +59,32 @@ def _clean_json(raw: str) -> str:
     return raw.strip()
 
 
-def _build_page_context(selected_pages: List[Dict[str, Any]]) -> str:
-    """Build a single context string from already-selected pages."""
-    if not selected_pages:
-        return ""
-    parts = []
+def _build_inmemory_index(selected_pages: List[Dict[str, Any]], embedding_model):
+    """Create an in-memory FAISS index from selected pages."""
+    texts = []
+    metadatas = []
     for page in selected_pages:
-        page_no = page.get("page_number") or page.get("page") or "?"
         text = page.get("text") or page.get("content") or ""
-        parts.append(f"--- Page {page_no} ---\n{text}")
-    return "\n\n".join(parts)
+        if not text.strip():
+            continue
+        page_no = page.get("page_number") or page.get("page") or -1
+        texts.append(text)
+        metadatas.append({"page_number": page_no})
+
+    if not texts:
+        return None
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1024,
+        chunk_overlap=128,
+    )
+    docs = splitter.create_documents(texts, metadatas=metadatas)
+    if not docs:
+        return None
+
+    logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
+    vectorstore = FAISS.from_documents(docs, embedding_model)
+    return vectorstore
 
 
 def rag_recovery(state: FinancialGraphState) -> dict:
@@ -79,7 +96,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     if not answers:
         return {"errors": errors + ["rag_recovery skipped: no answers"]}
-
     if not selected_pages:
         return {"errors": errors + ["rag_recovery skipped: no selected_pages"]}
 
@@ -95,11 +111,19 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics from {len(selected_pages)} selected pages")
 
-    page_context = _build_page_context(selected_pages)
-    if not page_context.strip():
-        return {"errors": errors + ["rag_recovery skipped: selected pages have no text"]}
-
     settings = get_settings()
+
+    # Embeddings + in-memory index
+    try:
+        embedding_model = create_embedding_model("text-embedding-3-large")
+        vectorstore = _build_inmemory_index(selected_pages, embedding_model)
+        if vectorstore is None:
+            return {"errors": errors + ["rag_recovery: failed to build in-memory index"]}
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+    except Exception as exc:
+        logger.exception("Failed to build in-memory index")
+        return {"errors": errors + [f"Failed to build index: {exc}"]}
+
     llm = create_llm(
         azure_deployment=settings.azure_openai_deployment,
         top_p=settings.llm_top_p,
@@ -107,7 +131,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
-        ("human", "Metrics to extract:\n{metrics_list}\n\nContext from selected pages:\n{context}"),
+        ("human", "Metrics to extract:\n{metrics_list}\n\nRetrieved context:\n{context}"),
     ])
 
     chain = prompt | llm | StrOutputParser()
@@ -124,15 +148,24 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             for a in batch
         )
 
+        # Build a query from the batch
+        query = " ".join(a.get("variable", "") for a in batch)
+
         logger.info(
             f"rag_recovery: batch {batch_idx + 1}/{(len(na_items) + BATCH_SIZE - 1) // BATCH_SIZE} "
             f"({len(batch)} metrics)"
         )
 
         try:
+            docs = retriever.invoke(query)
+            context = "\n\n".join(
+                f"[Page {d.metadata.get('page_number', '?')}]\n{d.page_content}"
+                for d in docs
+            )
+
             raw = chain.invoke({
                 "metrics_list": metrics_list,
-                "context": page_context,
+                "context": context,
             })
 
             cleaned = _clean_json(raw or "")
@@ -185,7 +218,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered}/{len(na_items)} "
-        f"in {elapsed:.1f}s (selected-pages only, batch size {BATCH_SIZE})"
+        f"in {elapsed:.1f}s (in-memory FAISS, batch size {BATCH_SIZE})"
     )
 
     return {
@@ -193,6 +226,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "answers_by_year": answers_by_year,
         "errors": errors,
         "use_rag": True,
-        "rag_collection_name": None,
+        "rag_collection_name": "in-memory-faiss",
     }
 ```
