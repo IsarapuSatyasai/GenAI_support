@@ -14,10 +14,14 @@ import os
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import AzureOpenAIEmbeddings
 
+from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.user_prompt import get_user_prompt
+from models import MultiYearExtractionResponse
 from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
 from config import get_settings
@@ -120,18 +124,20 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     settings = get_settings()
 
-    # Build LangChain embedding + in-memory index
     try:
         embedding_model = AzureOpenAIEmbeddings(
-            azure_deployment=settings.rag_embedding_model,  # "text-embedding-3-large"
+            azure_deployment=settings.rag_embedding_model,
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", settings.azure_openai_api_version),
-            # api_key is picked up from AZURE_OPENAI_API_KEY if present
+            api_version=os.environ.get(
+                "AZURE_OPENAI_API_VERSION", settings.azure_openai_api_version
+            ),
         )
         vectorstore = _build_inmemory_index(selected_pages, embedding_model)
         if vectorstore is None:
             return {"errors": errors + ["rag_recovery: failed to build in-memory index"]}
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+
+        # Optimal k for financial line-item recovery
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
     except Exception as exc:
         logger.exception("Failed to build in-memory index")
         return {"errors": errors + [f"Failed to build index: {exc}"]}
@@ -141,29 +147,45 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         top_p=settings.llm_top_p,
     ).with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", "Metrics to extract:\n{metrics_list}\n\nRetrieved context:\n{context}"),
-    ])
+    structured_llm = llm.with_structured_output(MultiYearExtractionResponse)
 
-    chain = prompt | llm | StrOutputParser()
-
-    BATCH_SIZE = 3
+    # Optimal batch size for ~166 N/A items (≈28 LLM calls)
+    BATCH_SIZE = 6
     recovered = 0
     start_time = time.time()
+    years = state.get("years") or []
 
     for batch_idx, i in enumerate(range(0, len(na_items), BATCH_SIZE)):
         batch = na_items[i : i + BATCH_SIZE]
-        metrics_list = "\n".join(
-            f"- {a.get('variable', '')}: "
-            f"{metric_lookup.get((a.get('worksheet'), a.get('variable')), {}).get('description') or a.get('variable', '')}"
+
+        user_metrics = [
+            {
+                "worksheet": a.get("worksheet"),
+                "variable": a.get("variable"),
+                "description": metric_lookup.get(
+                    (a.get("worksheet"), a.get("variable")), {}
+                ).get("description"),
+            }
             for a in batch
+        ]
+        user_prompt = get_user_prompt(user_metrics)
+
+        year_instruction = (
+            f"Extract every variable only for these years: {years}. "
+            "Return one answer object per variable per year. "
+            "Include the year field on every answer. "
+            "Prefer the primary consolidated statements over notes. "
+            "Apply the sign convention of the system prompt."
+            if years
+            else "Extract the most recent period available. "
+                 "Apply the sign convention of the system prompt."
         )
 
         query = " ".join(a.get("variable", "") for a in batch)
 
         logger.info(
-            f"rag_recovery: batch {batch_idx + 1}/{(len(na_items) + BATCH_SIZE - 1) // BATCH_SIZE} "
+            f"rag_recovery: batch {batch_idx + 1}/"
+            f"{(len(na_items) + BATCH_SIZE - 1) // BATCH_SIZE} "
             f"({len(batch)} metrics)"
         )
 
@@ -174,52 +196,46 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                 for d in docs
             )
 
-            raw = chain.invoke({
-                "metrics_list": metrics_list,
-                "context": context,
-            })
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"Please extract only the following missing variables:\n"
+                        f"{user_prompt}\n\n"
+                        f"{year_instruction}\n\n"
+                        f"Document context:\n{context}"
+                    )
+                ),
+            ]
 
-            cleaned = _clean_json(raw or "")
-            try:
-                parsed = json.loads(cleaned) if cleaned else {}
-            except json.JSONDecodeError:
-                logger.warning(f"Batch {batch_idx + 1} JSON parse failed. Raw: {cleaned[:300]}")
-                parsed = {}
+            response: MultiYearExtractionResponse = structured_llm.invoke(messages)
 
             for ans in batch:
                 var = ans.get("variable", "")
-                parsed_item = parsed.get(var)
-                if parsed_item is None:
-                    for k, v in parsed.items():
-                        if str(k).strip().lower() == var.lower():
-                            parsed_item = v
-                            break
-
-                if isinstance(parsed_item, dict):
-                    value = parsed_item.get("answer")
-                    source_fields = parsed_item.get("source_fields") or []
-                elif parsed_item is not None:
-                    value = parsed_item
-                    source_fields = []
-                else:
-                    value = None
-                    source_fields = []
-
-                if value is not None and str(value).strip().upper() not in ("N/A", "NA", "", "NONE"):
-                    ans["answer"] = str(value).strip()
-                    ans["confidence"] = 0.65
-                    ans["source_fields"] = source_fields if isinstance(source_fields, list) else []
-                    ans["source_text"] = str(value)[:500]
+                match = next(
+                    (a for a in response.answers if a.variable == var),
+                    None,
+                )
+                if (
+                    match
+                    and match.answer
+                    and str(match.answer).strip().upper() not in ("N/A", "NA", "")
+                ):
+                    ans["answer"] = str(match.answer).strip()
+                    ans["confidence"] = match.confidence or 0.65
+                    ans["source_fields"] = match.source_fields or []
+                    ans["source_text"] = (match.source_text or "")[:500]
                     ans["source_link"] = "RAG"
                     recovered += 1
-                    logger.info(f"  Recovered: {var} → {str(value)[:60]} | sources: {source_fields}")
+                    logger.info(
+                        f"  Recovered: {var} → {str(match.answer)[:60]}"
+                    )
 
         except Exception as exc:
             logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
             errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
 
     # Sync answers_by_year
-    years = state.get("years") or []
     latest = years[0] if years else None
     if latest is not None and latest in answers_by_year:
         answers_by_year[latest] = answers
@@ -229,7 +245,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered}/{len(na_items)} "
-        f"in {elapsed:.1f}s (in-memory FAISS, batch size {BATCH_SIZE})"
+        f"in {elapsed:.1f}s (in-memory FAISS, batch size {BATCH_SIZE}, k=10)"
     )
 
     return {
