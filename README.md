@@ -7,38 +7,22 @@ Retrieves top-k chunks per batch. No download, no persistent store.
 
 from typing import Any, Dict, List, Optional
 import logging
-import json
-import re
 import time
 import os
 
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import AzureOpenAIEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from prompts.system_prompt import SYSTEM_PROMPT
-from prompts.user_prompt import get_user_prompt
-from models import MultiYearExtractionResponse
 from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
 from config import get_settings
+from prompts.system_prompt import SYSTEM_PROMPT
+from prompts.user_prompt import get_user_prompt
+from models import MultiYearExtractionResponse
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """You are a financial data extraction assistant.
-Given retrieved passages from an annual report, extract the exact numeric
-value (or exactly "N/A" if truly absent) for each requested metric.
-Return ONLY a valid JSON object.
-Each key is the exact variable name.
-Each value is an object with:
-  - "answer": the extracted value as a string (keep thousand separators)
-  - "source_fields": list of original PDF line-item names used (empty list if N/A or unknown)
-Example:
-{"Net Sales": {"answer": "1,234,567", "source_fields": ["Revenue"]}, "Goodwill": {"answer": "N/A", "source_fields": []}}
-Do not invent numbers. Do not add any text, markdown, or explanation outside the JSON."""
 
 def _is_na(answer: Dict[str, Any]) -> bool:
     val = str(answer.get("answer", "")).strip().upper()
@@ -47,21 +31,6 @@ def _is_na(answer: Dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         conf = 0.0
     return val in ("N/A", "NA", "", "NONE") or conf == 0.0
-
-def _clean_json(raw: str) -> str:
-    if not raw:
-        return ""
-    raw = raw.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else raw
-        if raw.lstrip().startswith("json"):
-            raw = raw.lstrip()[4:]
-    raw = raw.strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        raw = match.group(0)
-    return raw.strip()
 
 def _build_inmemory_index(
     selected_pages: List[Dict[str, Any]],
@@ -82,18 +51,14 @@ def _build_inmemory_index(
         logger.warning("rag_recovery: no text found in selected_pages")
         return None
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1024,
-        chunk_overlap=128,
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=128)
     docs = splitter.create_documents(texts, metadatas=metadatas)
     if not docs:
         logger.warning("rag_recovery: no chunks created from selected_pages")
         return None
 
     logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
-    vectorstore = FAISS.from_documents(docs, embedding_model)
-    return vectorstore
+    return FAISS.from_documents(docs, embedding_model)
 
 def rag_recovery(state: FinancialGraphState) -> dict:
     answers: List[Dict[str, Any]] = state.get("answers", [])
@@ -108,8 +73,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         return {"errors": errors + ["rag_recovery skipped: no selected_pages"]}
 
     metric_lookup = {
-        (m.get("worksheet"), m.get("variable")): m
-        for m in excel_data
+        (m.get("worksheet"), m.get("variable")): m for m in excel_data
     }
     na_items = [a for a in answers if _is_na(a)]
 
@@ -136,20 +100,21 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         if vectorstore is None:
             return {"errors": errors + ["rag_recovery: failed to build in-memory index"]}
 
-        # Optimal k for financial line-item recovery
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
     except Exception as exc:
         logger.exception("Failed to build in-memory index")
         return {"errors": errors + [f"Failed to build index: {exc}"]}
 
+    # Correct order: structured output first, then retry
     llm = create_llm(
         azure_deployment=settings.azure_openai_deployment,
         top_p=settings.llm_top_p,
-    ).with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
+    )
+    structured_llm = (
+        llm.with_structured_output(MultiYearExtractionResponse)
+        .with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
+    )
 
-    structured_llm = llm.with_structured_output(MultiYearExtractionResponse)
-
-    # Optimal batch size for ~166 N/A items (≈28 LLM calls)
     BATCH_SIZE = 6
     recovered = 0
     start_time = time.time()
@@ -227,9 +192,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                     ans["source_text"] = (match.source_text or "")[:500]
                     ans["source_link"] = "RAG"
                     recovered += 1
-                    logger.info(
-                        f"  Recovered: {var} → {str(match.answer)[:60]}"
-                    )
+                    logger.info(f"  Recovered: {var} → {str(match.answer)[:60]}")
 
         except Exception as exc:
             logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
