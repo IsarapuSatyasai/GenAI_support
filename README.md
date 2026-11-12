@@ -15,6 +15,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_openai import AzureOpenAIEmbeddings
 
 from custom_lcel_components.llm import create_llm, create_embedding_model
 from graph.graph_state import FinancialGraphState
@@ -58,9 +59,8 @@ def _clean_json(raw: str) -> str:
         raw = match.group(0)
     return raw.strip()
 
-
-def _build_inmemory_index(selected_pages: List[Dict[str, Any]], embedding_model):
-    """Create an in-memory FAISS index from selected pages."""
+def _build_inmemory_index(selected_pages: List[Dict[str, Any]]):
+    """Create an in-memory FAISS index from selected pages using LangChain embeddings."""
     texts = []
     metadatas = []
     for page in selected_pages:
@@ -81,6 +81,14 @@ def _build_inmemory_index(selected_pages: List[Dict[str, Any]], embedding_model)
     docs = splitter.create_documents(texts, metadatas=metadatas)
     if not docs:
         return None
+
+    # LangChain embedding (not LlamaIndex)
+    embedding_model = AzureOpenAIEmbeddings(
+        azure_deployment="text-embedding-3-large",
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        # api_key is picked up from AZURE_OPENAI_API_KEY if set
+    )
 
     logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
     vectorstore = FAISS.from_documents(docs, embedding_model)
