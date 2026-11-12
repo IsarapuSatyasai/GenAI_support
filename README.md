@@ -2,14 +2,15 @@
 """Node: RAG recovery for N/A metrics.
 
 Builds an in-memory FAISS index from the already-selected pages.
-Retrieves top-k chunks per batch. No download, no persistent Chroma.
+Retrieves top-k chunks per batch. No download, no persistent store.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import logging
 import json
 import re
 import time
+import os
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,7 +18,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import AzureOpenAIEmbeddings
 
-from custom_lcel_components.llm import create_llm, create_embedding_model
+from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
 from config import get_settings
 
@@ -32,7 +33,7 @@ Each value is an object with:
   - "answer": the extracted value as a string (keep thousand separators)
   - "source_fields": list of original PDF line-item names used (empty list if N/A or unknown)
 Example:
-{{"Net Sales": {{"answer": "1,234,567", "source_fields": ["Revenue"]}}, "Goodwill": {{"answer": "N/A", "source_fields": []}}}}
+{"Net Sales": {"answer": "1,234,567", "source_fields": ["Revenue"]}, "Goodwill": {"answer": "N/A", "source_fields": []}}
 Do not invent numbers. Do not add any text, markdown, or explanation outside the JSON."""
 
 def _is_na(answer: Dict[str, Any]) -> bool:
@@ -42,7 +43,6 @@ def _is_na(answer: Dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         conf = 0.0
     return val in ("N/A", "NA", "", "NONE") or conf == 0.0
-
 
 def _clean_json(raw: str) -> str:
     if not raw:
@@ -59,8 +59,11 @@ def _clean_json(raw: str) -> str:
         raw = match.group(0)
     return raw.strip()
 
-def _build_inmemory_index(selected_pages: List[Dict[str, Any]]):
-    """Create an in-memory FAISS index from selected pages using LangChain embeddings."""
+def _build_inmemory_index(
+    selected_pages: List[Dict[str, Any]],
+    embedding_model: AzureOpenAIEmbeddings,
+) -> Optional[FAISS]:
+    """Create an in-memory FAISS index from selected pages."""
     texts = []
     metadatas = []
     for page in selected_pages:
@@ -72,6 +75,7 @@ def _build_inmemory_index(selected_pages: List[Dict[str, Any]]):
         metadatas.append({"page_number": page_no})
 
     if not texts:
+        logger.warning("rag_recovery: no text found in selected_pages")
         return None
 
     splitter = RecursiveCharacterTextSplitter(
@@ -80,20 +84,12 @@ def _build_inmemory_index(selected_pages: List[Dict[str, Any]]):
     )
     docs = splitter.create_documents(texts, metadatas=metadatas)
     if not docs:
+        logger.warning("rag_recovery: no chunks created from selected_pages")
         return None
-
-    # LangChain embedding (not LlamaIndex)
-    embedding_model = AzureOpenAIEmbeddings(
-        azure_deployment="text-embedding-3-large",
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-        # api_key is picked up from AZURE_OPENAI_API_KEY if set
-    )
 
     logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
     vectorstore = FAISS.from_documents(docs, embedding_model)
     return vectorstore
-
 
 def rag_recovery(state: FinancialGraphState) -> dict:
     answers: List[Dict[str, Any]] = state.get("answers", [])
@@ -117,13 +113,21 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         logger.info("rag_recovery: no N/A metrics to recover")
         return {"use_rag": False}
 
-    logger.info(f"rag_recovery: recovering {len(na_items)} N/A metrics from {len(selected_pages)} selected pages")
+    logger.info(
+        f"rag_recovery: recovering {len(na_items)} N/A metrics "
+        f"from {len(selected_pages)} selected pages"
+    )
 
     settings = get_settings()
 
-    # Embeddings + in-memory index
+    # Build LangChain embedding + in-memory index
     try:
-        embedding_model = create_embedding_model("text-embedding-3-large")
+        embedding_model = AzureOpenAIEmbeddings(
+            azure_deployment=settings.rag_embedding_model,  # "text-embedding-3-large"
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", settings.azure_openai_api_version),
+            # api_key is picked up from AZURE_OPENAI_API_KEY if present
+        )
         vectorstore = _build_inmemory_index(selected_pages, embedding_model)
         if vectorstore is None:
             return {"errors": errors + ["rag_recovery: failed to build in-memory index"]}
@@ -156,7 +160,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             for a in batch
         )
 
-        # Build a query from the batch
         query = " ".join(a.get("variable", "") for a in batch)
 
         logger.info(
