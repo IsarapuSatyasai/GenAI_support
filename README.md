@@ -16,8 +16,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.documents import Document
-from langchain_experimental.text_splitter import SemanticChunker
 
 from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
@@ -40,44 +38,28 @@ def _build_inmemory_index(
     selected_pages: List[Dict[str, Any]],
     embedding_model: AzureOpenAIEmbeddings,
 ) -> Optional[FAISS]:
-    docs = []
-    page_limit = 4500
-
-    semantic_splitter = SemanticChunker(
-        embeddings=embedding_model,
-        breakpoint_threshold_type="percentile",
-        breakpoint_threshold_amount=90,
-    )
-    recursive_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=3000,
-        chunk_overlap=250,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-
+    texts = []
+    metadatas = []
     for page in selected_pages:
         text = page.get("text") or page.get("content") or ""
         if not text.strip():
             continue
         page_no = page.get("page_number") or page.get("page") or -1
-        meta = {"page_number": page_no}
+        texts.append(text)
+        metadatas.append({"page_number": page_no})
 
-        if len(text) <= page_limit:
-            docs.append(Document(page_content=text, metadata=meta))
-            continue
-
-        try:
-            splits = semantic_splitter.create_documents([text], metadatas=[meta])
-            if splits and all(len(s.page_content) < 6000 for s in splits):
-                docs.extend(splits)
-                continue
-        except Exception:
-            logger.warning(f"Semantic split failed for page {page_no}, falling back")
-
-        splits = recursive_splitter.create_documents([text], metadatas=[meta])
-        docs.extend(splits)
-
-    if not docs:
+    if not texts:
         logger.warning("rag_recovery: no text found in selected_pages")
+        return None
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2048,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    docs = splitter.create_documents(texts, metadatas=metadatas)
+    if not docs:
+        logger.warning("rag_recovery: no chunks created from selected_pages")
         return None
 
     logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
@@ -105,31 +87,12 @@ def _update_answer_for_year(
             return True
     return False
 
-def _apply_mandatory_mappings(
-    answers_by_year: Dict[Any, List[Dict[str, Any]]],
-    excel_data: List[Dict[str, Any]],
-) -> int:
-    template_map = {}
-    for m in excel_data:
-        var = m.get("variable")
-        if not var:
-            continue
-        desc = (m.get("description") or "") + " " + (m.get("remarks") or "")
-        template_map[var] = desc.lower()
-
-    source_phrases = {
+def _apply_mandatory_mappings(answers_by_year: Dict[Any, List[Dict[str, Any]]]) -> int:
+    rules = {
         "Depreciation": ["amortization and depreciation", "depreciation and amortisation"],
         "Other Labour Costs": ["social securities and pension costs", "total labour costs", "staff costs"],
-        "Interest Received - cash": ["interest income", "interest received"],
-        "General Costs": ["other operating expenses", "other expenses", "administrative expenses"],
-        "Income from Other Finan Assets - cash": ["finance income", "finance income received"],
-        "3rd Party Svc's (Sub-Contr Work)": ["costs incurred from financial institutions"],
-        "Other Income": ["other income/(expenses)", "other income"],
-        "Accounts Receivable Trade": ["trade and other receivables"],
-        "Account Payable Trade": ["trade and other payables"],
-        "Deferred Taxes Asset": ["deferred tax assets"],
+        "Interest Received - cash": ["interest income"],
     }
-
     updated = 0
     for year, year_answers in answers_by_year.items():
         source_pool = " ".join(
@@ -137,18 +100,16 @@ def _apply_mandatory_mappings(
             for a in year_answers
         ).lower()
 
-        for target_var, phrases in source_phrases.items():
-            if target_var not in template_map:
-                continue
+        for target_var, keywords in rules.items():
             for item in year_answers:
                 if item.get("variable") != target_var:
                     continue
                 if not _is_na(item):
                     continue
-                if any(p in source_pool for p in phrases):
+                if any(kw in source_pool for kw in keywords):
                     for sibling in year_answers:
                         sib_text = (sibling.get("source_text") or "").lower()
-                        if any(p in sib_text for p in phrases) and not _is_na(sibling):
+                        if any(kw in sib_text for kw in keywords) and not _is_na(sibling):
                             item["answer"] = sibling["answer"]
                             item["confidence"] = 0.7
                             item["source_fields"] = sibling.get("source_fields", [])
@@ -211,14 +172,15 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     llm = create_llm(
         azure_deployment=settings.azure_openai_deployment,
-        top_p=settings.llm_top_p,
+        temperature=0.0,
+        top_p=0.1,
     )
     structured_llm = (
         llm.with_structured_output(MultiYearExtractionResponse)
         .with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
     )
 
-    BATCH_SIZE = 6
+    BATCH_SIZE = 3
     recovered = 0
     start_time = time.time()
     years = state.get("years") or list(answers_by_year.keys())
@@ -310,7 +272,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
             errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
 
-    rule_updated = _apply_mandatory_mappings(answers_by_year, excel_data)
+    rule_updated = _apply_mandatory_mappings(answers_by_year)
     logger.info(f"rag_recovery: rule-based mappings applied: {rule_updated}")
 
     latest = years[0] if years else None
