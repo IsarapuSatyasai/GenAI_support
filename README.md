@@ -1,15 +1,16 @@
 ```python
 """Node: RAG recovery for N/A metrics.
 
-Builds an in-memory FAISS index from the already-selected pages.
-Retrieves top-k chunks per batch. No download, no persistent store.
-Writes recovered values into the correct year columns.
+Builds an in-memory FAISS index from the pages already selected by the
+upstream node and attempts to fill any remaining missing values. The
+index is created fresh on each run and discarded when the node finishes.
 """
 
 from typing import Any, Dict, List, Optional
 import logging
 import time
 import os
+from collections import defaultdict
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -37,7 +38,6 @@ def _build_inmemory_index(
     selected_pages: List[Dict[str, Any]],
     embedding_model: AzureOpenAIEmbeddings,
 ) -> Optional[FAISS]:
-    """Create an in-memory FAISS index from selected pages."""
     texts = []
     metadatas = []
     for page in selected_pages:
@@ -52,7 +52,11 @@ def _build_inmemory_index(
         logger.warning("rag_recovery: no text found in selected_pages")
         return None
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=128)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2048,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
     docs = splitter.create_documents(texts, metadatas=metadatas)
     if not docs:
         logger.warning("rag_recovery: no chunks created from selected_pages")
@@ -70,7 +74,6 @@ def _update_answer_for_year(
     source_fields: list,
     source_text: str,
 ) -> bool:
-    """Write a recovered value into the correct year bucket. Returns True if updated."""
     year_list = answers_by_year.get(year)
     if not year_list:
         return False
@@ -83,6 +86,39 @@ def _update_answer_for_year(
             item["source_link"] = "RAG"
             return True
     return False
+
+def _apply_mandatory_mappings(answers_by_year: Dict[Any, List[Dict[str, Any]]]) -> int:
+    rules = {
+        "Depreciation": ["amortization and depreciation", "depreciation and amortisation"],
+        "Other Labour Costs": ["social securities and pension costs", "total labour costs", "staff costs"],
+        "Interest Received - cash": ["interest income"],
+    }
+    updated = 0
+    for year, year_answers in answers_by_year.items():
+        source_pool = " ".join(
+            (a.get("source_text") or "") + " " + (a.get("source_heading") or "")
+            for a in year_answers
+        ).lower()
+
+        for target_var, keywords in rules.items():
+            for item in year_answers:
+                if item.get("variable") != target_var:
+                    continue
+                if not _is_na(item):
+                    continue
+                if any(kw in source_pool for kw in keywords):
+                    for sibling in year_answers:
+                        sib_text = (sibling.get("source_text") or "").lower()
+                        if any(kw in sib_text for kw in keywords) and not _is_na(sibling):
+                            item["answer"] = sibling["answer"]
+                            item["confidence"] = 0.7
+                            item["source_fields"] = sibling.get("source_fields", [])
+                            item["source_text"] = sibling.get("source_text", "")[:500]
+                            item["source_link"] = "RULE"
+                            updated += 1
+                            logger.info(f"  Rule-mapped: {target_var} ({year}) → {sibling['answer']}")
+                            break
+    return updated
 
 def rag_recovery(state: FinancialGraphState) -> dict:
     answers: List[Dict[str, Any]] = state.get("answers", [])
@@ -100,7 +136,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         (m.get("worksheet"), m.get("variable")): m for m in excel_data
     }
 
-    # Collect N/A items across all years
     na_items = []
     for year, year_answers in answers_by_year.items():
         for a in year_answers:
@@ -137,7 +172,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     llm = create_llm(
         azure_deployment=settings.azure_openai_deployment,
-        top_p=settings.llm_top_p,
+        temperature=0.0,
+        top_p=0.1,
     )
     structured_llm = (
         llm.with_structured_output(MultiYearExtractionResponse)
@@ -149,8 +185,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     start_time = time.time()
     years = state.get("years") or list(answers_by_year.keys())
 
-    # Group N/A items by variable so we ask for all years of a metric together
-    from collections import defaultdict
     by_var = defaultdict(list)
     for year, item in na_items:
         by_var[item.get("variable")].append((year, item))
@@ -175,13 +209,10 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
         year_instruction = (
             f"You MUST return one answer object for EVERY year in this list: {years}. "
-            "Do not omit any year. If a value exists for a prior year (e.g. 2023), include it. "
+            "Do not omit any year. If a value exists for a prior year, include it. "
             "If a value does not exist for a year, still return an object for that year with answer = 'N/A'. "
             "Include the year field on every answer. "
-            "Apply the mandatory mappings from the system prompt: "
-            "Depreciation → Amortization and depreciation (both years), "
-            "Other Labour Costs → Social securities and pension costs (both years), "
-            "Interest Received - cash → Interest income (both years)."
+            "Apply the mandatory mappings from the system prompt."
         )
 
         query = " ".join(batch_vars)
@@ -241,7 +272,9 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
             errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
 
-    # Rebuild the flat answers list from the latest year (for downstream nodes)
+    rule_updated = _apply_mandatory_mappings(answers_by_year)
+    logger.info(f"rag_recovery: rule-based mappings applied: {rule_updated}")
+
     latest = years[0] if years else None
     if latest is not None and latest in answers_by_year:
         answers = answers_by_year[latest]
