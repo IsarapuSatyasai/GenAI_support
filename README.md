@@ -5,6 +5,8 @@ Builds a transient in-memory FAISS index from the already-selected pages
 using sentence-window chunking, retrieves top-k chunks, and writes
 recovered values into the correct year buckets.
 Uses the same SYSTEM_PROMPT as the primary LLM extraction.
+Designed for deterministic, template-strict recovery with Income Statement
+and Amortisation priority.
 No persistent store is used.
 """
 
@@ -51,19 +53,21 @@ def _build_inmemory_index(
             continue
         page_no = page.get("page_number") or page.get("page") or -1
 
-        # Split into sentences
-        raw_sentences = text.replace("\n", " ").split(". ")
-        sentences = [s.strip() for s in raw_sentences if s.strip()]
+        cleaned = " ".join(text.split())
+        raw_sentences = cleaned.split(". ")
+        sentences = [s.strip() for s in raw_sentences if s.strip() and len(s.strip()) > 10]
         if not sentences:
             continue
 
-        window_size = 5      # sentences in each window
-        step = 3             # overlap of 2 sentences
+        window_size = 6
+        step = 3
 
         for i in range(0, len(sentences), step):
             window = sentences[i:i + window_size]
+            if len(window) < 2:
+                continue
             chunk_text = ". ".join(window)
-            if len(chunk_text) < 40:
+            if len(chunk_text) < 60:
                 continue
             docs.append(
                 Document(
@@ -141,7 +145,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         vectorstore = _build_inmemory_index(selected_pages, embedding_model)
         if vectorstore is None:
             return {"errors": errors + ["rag_recovery: failed to build index"]}
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 18})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
     except Exception as exc:
         logger.exception("Index build failed")
         return {"errors": errors + [f"Failed to build index: {exc}"]}
@@ -152,7 +156,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         .with_retry(wait_exponential_jitter=True, stop_after_attempt=3)
     )
 
-    BATCH_SIZE = 5
+    BATCH_SIZE = 4
     recovered = 0
     start_time = time.time()
     years = state.get("years") or list(answers_by_year.keys())
@@ -181,16 +185,21 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             "If a value exists, include it. If it does not exist, still return the object with answer = 'N/A'. "
             "Include the year field on every answer. "
             "STRICT TEMPLATE ADHERENCE: return only the variables listed below; do not invent extras. "
-            "INCOME STATEMENT PRIORITY: for every P&L metric you must search the face of the Income Statement / Statement of Comprehensive Income and related notes before returning N/A. "
-            "Apply the mandatory mappings from the system prompt for both years: "
-            "Depreciation → Amortization and depreciation, "
+            "INCOME STATEMENT PRIORITY (highest): for every P&L metric you must search the face of the Income Statement / Statement of Comprehensive Income and related notes before returning N/A. "
+            "AMORTISATION FOCUS: for the Amortisation variable, extract ONLY the intangible-asset amortisation amount from the intangible assets note or the cash-flow breakdown. "
+            "Do NOT copy the combined Amortization and depreciation figure into Amortisation. "
+            "Apply the mandatory mappings from the system prompt for both years without exception: "
+            "Depreciation → Amortization and depreciation (face of Income Statement), "
+            "Amortisation → intangible amortisation only (note or cash-flow), "
             "Other Labour Costs → Social securities and pension costs (or Total/Staff labour costs), "
             "General Costs → Other operating expenses, "
             "Interest Received - cash → Interest income, "
             "Income from Other Finan Assets - cash → Finance income, "
-            "Salaries → Wages and salaries. "
+            "Salaries → Wages and salaries, "
+            "Net Sales / primary revenue → face-of-statement revenue total. "
             "Prefer face-of-statement totals. Report costs/expenses as positive numbers. "
-            "Preserve thousand separators and use a leading minus for negatives."
+            "Preserve thousand separators exactly and use a leading minus for negatives. "
+            "Follow the system prompt completely."
         )
 
         query = " ".join(batch_vars)
@@ -207,9 +216,14 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(
                     content=(
+                        "CRITICAL: Strictly follow the system prompt. "
+                        "Return exactly the template variables requested — nothing more, nothing less. "
                         "Focus especially on completing every Income Statement variable. "
-                        "Search the face of the Income Statement and related notes thoroughly. "
-                        "Follow the system prompt exactly (template adherence, mandatory mappings, multi-year, signs, formatting).\n\n"
+                        "For Amortisation: extract only the intangible-asset amortisation line (from the intangible assets note or cash-flow breakdown). "
+                        "Do not use the combined Amortization and depreciation figure for Amortisation. "
+                        "Search the face of the Income Statement / Statement of Comprehensive Income and related notes thoroughly before any N/A. "
+                        "Apply all mandatory mappings and multi-year rules. "
+                        "Preserve exact formatting and sign conventions.\n\n"
                         f"Extract only the following missing variables:\n{user_prompt}\n\n"
                         f"{year_instruction}\n\n"
                         f"Document context:\n{context}"
@@ -247,13 +261,12 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             logger.warning("Batch %d failed: %s", batch_idx + 1, exc)
             errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
 
-    # Rebuild flat answers from the latest year
     latest = years[0] if years else None
     if latest is not None and latest in answers_by_year:
         answers = answers_by_year[latest]
 
     logger.info(
-        "rag_recovery finished: recovered %d pairs in %.1fs (sentence-window, k=18, batch=%d)",
+        "rag_recovery finished: recovered %d pairs in %.1fs (sentence-window 6/3, k=20, batch=%d)",
         recovered, time.time() - start_time, BATCH_SIZE,
     )
 
