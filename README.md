@@ -261,7 +261,14 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             "Interest Received - cash → Interest income (both years)."
         )
 
-        query = " ".join(batch_vars)
+        # Boost Income Statement terms in the retrieval query
+        income_statement_boost = (
+            "Consolidated Statement of Comprehensive Income Income Statement "
+            "Profit and Loss Non-interest revenue Wages and salaries "
+            "Social securities and pension costs Other operating expenses "
+            "Amortization and depreciation Net income"
+        )
+        query = " ".join(batch_vars) + " " + income_statement_boost
 
         logger.info(
             "rag_recovery: batch %d/%d (%d metrics)",
@@ -281,6 +288,13 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(
                     content=(
+                        "CRITICAL ADDITIONAL INSTRUCTIONS (must be followed together with the system prompt):\n"
+                        "- Strictly search the face of the Consolidated Statement of Comprehensive Income / Income Statement first for every N/A metric.\n"
+                        "- Deeply examine both the current-year and prior-year columns on the Income Statement before considering any note.\n"
+                        "- For every P&L-related variable, prefer the face-of-statement line item. Only use a note if the face total is absent.\n"
+                        "- Apply all mandatory mappings from the system prompt without exception (Depreciation, Amortization, Other Labour Costs, Interest Received - cash, etc.).\n"
+                        "- Do not return N/A for an Income Statement metric if a clear equivalent line exists on the face of the statement.\n"
+                        "- Return one answer object per variable per year. Preserve exact formatting and sign conventions from the system prompt.\n\n"
                         f"Please extract only the following missing variables:\n"
                         f"{user_prompt}\n\n"
                         f"{year_instruction}\n\n"
