@@ -1,18 +1,113 @@
 ```python
-"""RAG recovery node for missing financial metrics.
+"""System prompt for financial spreading: LLM Agent will always follow these set of instructions."""
 
-Builds a transient in-memory FAISS index over the already-selected pages,
-retrieves the most relevant chunks for each batch of N/A metrics, and
-writes any recovered values back into the correct year buckets.
+SYSTEM_PROMPT = """\
+You are a senior credit analyst who works on financial spreading. You are specializing in extracting structured financial data from annual report PDFs.
 
-No external downloads and no persistent vector store are used.
+## Critical extraction discipline:
+
+- Strictly and deeply examine both the Excel template metrics and the full content of the input PDF before returning any value.
+- Cross-check every template variable against the primary statements, notes, and any comparative columns. Do not stop at the first possible match.
+- Prefer evidence that is explicitly present in the PDF over any assumption. If a number or mapping is visible, extract it.
+- When in doubt, re-scan the relevant statement and notes rather than defaulting to N/A.
+- Treat the template as the complete list of required outputs and the PDF as the sole source of truth.
+
+## Non-negotiable rules:
+
+1. **All available periods** - Extract values for every comparative year present in the document (typically the current and prior year). Return one answer object per metric per year. Do not drop prior-year columns. If a value exists for 2023, you MUST return it. Never leave a prior year as N/A when the number is visible on the statement.
+2. **Consolidated preferred** - Extract consolidated financial statements if available. If not, extract the most detailed statements available.
+3. **No guessing** - Do NOT invent numbers. If a metric cannot be found or reliably derived, return "N/A" and explain what is missing.
+4. **Keep source details** - Report numerical values exactly as they appear. Always capture: currency (EUR, GBP, USD, etc.), scale (units, thousands, millions), fiscal year end, consolidation scope, and period label.
+5. **English output** - Always provide output like remarks, explanations, and other text in English, even when the source document is in another language (e.g. Dutch, German, etc.). Translate faithfully and accurately.
+6. **MetaData** - For text fields, always return the exact text as it appears in the PDF. Use description provided in the user prompt to check expected values.
+7. **Evidence** - for every metric, provide a page reference (page number as shown in the PDF). Also provide hyperlink to the source document section.
+8. Do not skip. Always provide one output for every variable supplied by the Excel template.
+   If the metric is not found in the document:
+       answer = "N/A"
+       confidence = 0.0
+       page_number = -1
+       source_fields = []
+       formula = null
+       source_heading = null
+       source_text = null
+9. **Confidence score** - Rate each extraction on the scale between 0 to 10, where 0 means not found, 10 means 100% confident. And 1 means not confident at all.
+10. **Preserve exact formatting** - Return numeric answers with the digits and thousand separators exactly as they appear in the source document (e.g. 13,950). Do not remove commas or convert to plain integers. The only change allowed is the sign, which must follow rule 11: never return parentheses; write a negative value with a leading minus (e.g. (74,929) in the source becomes -74,929 for a contra item).
+11. **Consistency** - Keep sign conventions consistent:
+- Assets: positive
+- Liabilities & equity: positive
+- Contra items (accumulated depreciation/amortization, provisions/revaluation of inventory, doubtful debtor provisions, treasury stock): negative
+- P&L: revenues and costs/expenses are both positive. Report costs/expenses (cost of goods sold, salaries, labour costs, general costs, depreciation, amortisation, interest paid, tax, etc.) as positive amounts even when the source shows them in parentheses or with a minus sign (e.g. (606,898) in the source becomes 606,898). Only items that genuinely reduce cost or represent a loss/negative result (e.g. a net loss, negative EBIT, a cost reversal or release) are negative.
+- Total assets: Not equal to 0
+- Net fixed assets: Not less than 0
+- Total liabilities: Not equal to 0
+- Current assets: Not less than 0
+- Inventory: Not less than 0
+- Net worth: Not equal to 0
+- Current liabilities: Not less than 0
+- Net sales: Greater than 0
+- Accounts Receivable Trade: Not less than 0
+- Cash and Bank: Not less than 0
+- Loans: Not less than 0
+- Perform integrity checks and report results:
+ a) Balance sheet must balance. Verify that the accounting equation holds: Total Assets = Total Equity & Reserves & Liabilities (or Assets = Liabilities + Equity)
+ b) Cash flow net change equals change in Cash & Bank between periods (if cash flow statement present)
+ c) Subtotals equal sum of components when components exist
+12. **Source field mapping** - Always provide the source field name for each extracted value. This is the name of the field in the source document.
+ - If a PDF line item matches directly with extracted metric and has 1 to 1 mapping, then provide name of original PDF line item as 'source_fields' and keep the 'formula' value as null.
+ - If a extracted metric is sum of several PDF line items, then list every original source field name in 'source_fields' and set 'formula' to the sum.
+ For e.g. if you need to extract value for 'Tax Payables & Social Security Contr.' which is sum of 'Corporation Tax' and 'Other taxation and Social Security', then set 'source_fields' to ['Corporation Tax', 'Other taxation and Social Security'] and 'formula' to 'Corporation Tax + Other taxation and Social Security'.
+13. **Name mapping and primary-statement preference**
+   Template variable names may not match PDF labels exactly. Always search for a clear semantic equivalent before returning N/A.
+
+   Prefer the amount shown on the face of the primary consolidated statements (Balance Sheet, Income Statement, Cash Flow Statement) over note breakdowns when both exist and represent the same concept.
+
+   Rules:
+   - Prefer a matching or clearly equivalent line on the face of the primary statement.
+   - Only use a note sub-line when the face total is not available or the template explicitly requires the breakdown.
+   - When you map a different label, set source_fields to the original PDF label and include the heading + full source text.
+   - Be consistent: if you map “Trade and other receivables” to Accounts Receivable Trade, use the face balance-sheet total, not a note component.
+   - Prefer a matching PDF line over N/A when the label clearly represents the same metric.
+14. **Mandatory mappings for these specific template variables** (do not return N/A if the equivalent exists):
+   - Other Labour Costs: MUST map to “Social securities and pension costs”, “Total Labour Costs”, “Staff Costs”, or any combined labour line. Do not leave Other Labour Costs as N/A when any labour cost line is present.
+   - General Costs: must map to “Other Expenses”, “Other operating expenses”, or “Administrative expenses”.
+   - Interest Received - cash: MUST map to “Interest income” or “Interest Received” on the Income Statement or Cash Flow Statement. Do not return N/A if Interest income is shown.
+   - Income from Other Finan Assets - cash: must map to “Finance income”, “Income From Other Financial Assets”, or “Finance income received”.
+   When mapping, always fill source_heading and source_text with the original PDF heading and line.
+15. **Source attribution** - For every metric, also provide:
+   - source_heading: the section, table, or paragraph heading where the value was found (or the closest matching section if the exact metric is N/A).
+   - source_text: the COMPLETE relevant paragraph or full table that contains the value or the closest related line.
+     Even when the answer is "N/A", still return the nearest matching table/paragraph (e.g. the Total Labour Costs line when Salaries/Other Labour Costs cannot be split) so a human can see what context was considered.
+   First locate the relevant heading/section, then extract the value (or N/A) and the complete source context.
+16. **Primary statement totals and related items**
+   - Depreciation: MUST map to the combined “Amortization and depreciation” (or “Depreciation and amortisation”) line from the face of the Income Statement. Do not return N/A if this line exists. Return the value for every year shown.
+   - Amortisation: extract only the intangible amortisation amount (from the intangible assets note or cash-flow breakdown). Do not copy the combined Depreciation figure into Amortisation.
+   - Accounts Receivable Trade → prefer “Trade and other receivables” from the Balance Sheet.
+   - Account Payable Trade → prefer “Trade and other payables” from the Balance Sheet (not the “Trade payables” sub-line in the note).
+   - Deferred Taxes Asset → “Deferred tax assets” from the Balance Sheet.
+   - Lease Obligations – Current / LT Portion → current and non-current “Lease liability” from the Balance Sheet.
+   - Tax Payables & Social Security Contr. → prefer “Current income tax payables” or the closest face total; if only a note breakdown exists, use the relevant total and document it.
+
+   When both a face total and a note breakdown exist, report the face total unless the template variable clearly asks for a component.
+
+17. **Multi-year requirement** - For every variable you extract, you MUST return a separate answer object for each year present in the document (e.g. 2024 AND 2023). Never return only the latest year. If a prior-year value is visible, include it. If a prior-year value is truly absent, still return an object for that year with answer = "N/A". Include the year field on every answer object.
+
+## Output format:
+Return a single JSON object matching the ExtractionResponse schema provided in the user message. Do not add anything outside JSON object.
+"""
+```
+
+```python
+"""Node: RAG recovery for N/A metrics.
+
+Builds an in-memory FAISS index from the already-selected pages.
+Retrieves top-k chunks per batch. No download, no persistent store.
+Writes recovered values into the correct year columns.
 """
 
 from typing import Any, Dict, List, Optional
 import logging
 import time
 import os
-from collections import defaultdict
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -28,20 +123,7 @@ from models import MultiYearExtractionResponse
 
 logger = logging.getLogger(__name__)
 
-
 def _is_na(answer: Dict[str, Any]) -> bool:
-    """Return True if the answer is missing or has zero confidence.
-
-    Treats the common sentinel values (N/A, NA, empty string, NONE)
-    and a confidence of 0.0 as "not available".
-
-    Args:
-        answer: A single metric answer dict that must contain at least
-            the keys ``answer`` and ``confidence``.
-
-    Returns:
-        True when the value should be considered missing, False otherwise.
-    """
     val = str(answer.get("answer", "")).strip().upper()
     try:
         conf = float(answer.get("confidence", 0) or 0)
@@ -49,26 +131,11 @@ def _is_na(answer: Dict[str, Any]) -> bool:
         conf = 0.0
     return val in ("N/A", "NA", "", "NONE") or conf == 0.0
 
-
 def _build_inmemory_index(
     selected_pages: List[Dict[str, Any]],
     embedding_model: AzureOpenAIEmbeddings,
 ) -> Optional[FAISS]:
-    """Create a transient in-memory FAISS index from the selected pages.
-
-    Pages are split into overlapping chunks; each chunk retains its
-    original page number in metadata so later citations stay accurate.
-
-    Args:
-        selected_pages: List of page dicts. Each dict is expected to
-            contain either a ``text`` or ``content`` field and optionally
-            a ``page_number`` / ``page`` field.
-        embedding_model: Configured Azure OpenAI embeddings client.
-
-    Returns:
-        A FAISS vector store ready for retrieval, or None if no usable
-        text was found in the supplied pages.
-    """
+    """Create an in-memory FAISS index from selected pages."""
     texts = []
     metadatas = []
     for page in selected_pages:
@@ -89,9 +156,8 @@ def _build_inmemory_index(
         logger.warning("rag_recovery: no chunks created from selected_pages")
         return None
 
-    logger.info("Building in-memory FAISS index from %d chunks", len(docs))
+    logger.info(f"Building in-memory FAISS index from {len(docs)} chunks")
     return FAISS.from_documents(docs, embedding_model)
-
 
 def _update_answer_for_year(
     answers_by_year: Dict[Any, List[Dict[str, Any]]],
@@ -102,24 +168,7 @@ def _update_answer_for_year(
     source_fields: list,
     source_text: str,
 ) -> bool:
-    """Write a recovered value into the matching year bucket.
-
-    Only updates an entry when the variable matches and the current
-    value is still considered N/A. The source link is forced to ``"RAG"``
-    so downstream consumers can distinguish recovered values.
-
-    Args:
-        answers_by_year: Nested mapping of year → list of answer dicts.
-        variable: Metric name to match.
-        year: Fiscal year of the bucket that should be updated.
-        new_answer: Recovered value (already stripped).
-        confidence: Confidence score assigned by the LLM.
-        source_fields: List of source field names (may be empty).
-        source_text: Raw text snippet that supported the extraction.
-
-    Returns:
-        True if an N/A entry was found and updated, False otherwise.
-    """
+    """Write a recovered value into the correct year bucket. Returns True if updated."""
     year_list = answers_by_year.get(year)
     if not year_list:
         return False
@@ -133,34 +182,7 @@ def _update_answer_for_year(
             return True
     return False
 
-
 def rag_recovery(state: FinancialGraphState) -> dict:
-    """Recover missing (N/A) financial metrics via in-memory RAG.
-
-    Workflow:
-        1. Identify every N/A metric-year pair in ``answers_by_year``.
-        2. Build a one-shot FAISS index from the already-selected pages.
-        3. Group missing metrics by variable and process them in small
-           batches so the LLM receives a focused context window.
-        4. For each batch, retrieve the top-k chunks, ask the structured
-           LLM for every requested year, and write successful recoveries
-           back into the correct year buckets.
-        5. Rebuild the flat ``answers`` list from the latest year so
-           downstream nodes continue to see a consistent view.
-
-    The function is intentionally side-effect free with respect to
-    external services: the vector store lives only for the duration of
-    the call and is discarded when the function returns.
-
-    Args:
-        state: Current graph state. Must contain at least ``answers``,
-            ``answers_by_year``, ``excel_data`` and ``selected_pages``.
-
-    Returns:
-        Partial state update containing the (possibly enriched)
-        ``answers`` and ``answers_by_year`` dictionaries, any errors
-        encountered, and a flag indicating that RAG was used.
-    """
     answers: List[Dict[str, Any]] = state.get("answers", [])
     answers_by_year: Dict[Any, List[Dict[str, Any]]] = state.get("answers_by_year", {})
     excel_data = state.get("excel_data", [])
@@ -188,9 +210,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         return {"use_rag": False}
 
     logger.info(
-        "rag_recovery: recovering %d N/A metric-year pairs from %d selected pages",
-        len(na_items),
-        len(selected_pages),
+        f"rag_recovery: recovering {len(na_items)} N/A metric-year pairs "
+        f"from {len(selected_pages)} selected pages"
     )
 
     settings = get_settings()
@@ -227,6 +248,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     years = state.get("years") or list(answers_by_year.keys())
 
     # Group N/A items by variable so we ask for all years of a metric together
+    from collections import defaultdict
     by_var = defaultdict(list)
     for year, item in na_items:
         by_var[item.get("variable")].append((year, item))
@@ -255,26 +277,17 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             "If a value does not exist for a year, still return an object for that year with answer = 'N/A'. "
             "Include the year field on every answer. "
             "Apply the mandatory mappings from the system prompt: "
-            "Depreciation → depreciation (both years), "
-            "Amortization → amortization (both years), "
+            "Depreciation → Amortization and depreciation (both years), "
             "Other Labour Costs → Social securities and pension costs (both years), "
             "Interest Received - cash → Interest income (both years)."
         )
 
-        # Boost Income Statement terms in the retrieval query
-        income_statement_boost = (
-            "Consolidated Statement of Comprehensive Income Income Statement "
-            "Profit and Loss Non-interest revenue Wages and salaries "
-            "Social securities and pension costs Other operating expenses "
-            "Amortization and depreciation Net income"
-        )
-        query = " ".join(batch_vars) + " " + income_statement_boost
+        query = " ".join(batch_vars)
 
         logger.info(
-            "rag_recovery: batch %d/%d (%d metrics)",
-            batch_idx + 1,
-            (len(var_list) + BATCH_SIZE - 1) // BATCH_SIZE,
-            len(batch_vars),
+            f"rag_recovery: batch {batch_idx + 1}/"
+            f"{(len(var_list) + BATCH_SIZE - 1) // BATCH_SIZE} "
+            f"({len(batch_vars)} metrics)"
         )
 
         try:
@@ -288,13 +301,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(
                     content=(
-                        "CRITICAL ADDITIONAL INSTRUCTIONS (must be followed together with the system prompt):\n"
-                        "- Strictly search the face of the Consolidated Statement of Comprehensive Income / Income Statement first for every N/A metric.\n"
-                        "- Deeply examine both the current-year and prior-year columns on the Income Statement before considering any note.\n"
-                        "- For every P&L-related variable, prefer the face-of-statement line item. Only use a note if the face total is absent.\n"
-                        "- Apply all mandatory mappings from the system prompt without exception (Depreciation, Amortization, Other Labour Costs, Interest Received - cash, etc.).\n"
-                        "- Do not return N/A for an Income Statement metric if a clear equivalent line exists on the face of the statement.\n"
-                        "- Return one answer object per variable per year. Preserve exact formatting and sign conventions from the system prompt.\n\n"
                         f"Please extract only the following missing variables:\n"
                         f"{user_prompt}\n\n"
                         f"{year_instruction}\n\n"
@@ -326,14 +332,11 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                     if updated:
                         recovered += 1
                         logger.info(
-                            "  Recovered: %s (%s) → %s",
-                            var,
-                            year,
-                            str(match.answer)[:60],
+                            f"  Recovered: {var} ({year}) → {str(match.answer)[:60]}"
                         )
 
         except Exception as exc:
-            logger.warning("Batch %d failed: %s", batch_idx + 1, exc)
+            logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
             errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
 
     # Rebuild the flat answers list from the latest year (for downstream nodes)
@@ -343,11 +346,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
 
     elapsed = time.time() - start_time
     logger.info(
-        "rag_recovery finished: recovered %d metric-year pairs in %.1fs "
-        "(in-memory FAISS, batch size %d, k=10)",
-        recovered,
-        elapsed,
-        BATCH_SIZE,
+        f"rag_recovery finished: recovered {recovered} metric-year pairs "
+        f"in {elapsed:.1f}s (in-memory FAISS, batch size {BATCH_SIZE}, k=10)"
     )
 
     return {
