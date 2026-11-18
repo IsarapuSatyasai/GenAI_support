@@ -6,12 +6,9 @@ by the upstream selection step. For every metric that is still missing,
 it retrieves the most relevant chunks and asks the model to fill the
 value for each year present in the document. The index is discarded
 when the node finishes.
-
-Successfully recovered metric-year pairs are remembered for the life
-of the process so later runs can skip them and concentrate on the rest.
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 import logging
 import time
 import os
@@ -32,9 +29,6 @@ from models import MultiYearExtractionResponse
 
 logger = logging.getLogger(__name__)
 
-# Process-level cache of metric-year pairs that were already recovered
-_RECOVERED_CACHE: Set[Tuple[str, Any]] = set()
-
 SYNONYM_MAP = {
     "Depreciation": "amortization and depreciation depreciation and amortisation depreciation",
     "Amortisation": "amortization intangible assets amortisation",
@@ -47,6 +41,7 @@ SYNONYM_MAP = {
     "Account Payable Trade": "trade and other payables trade payables",
     "Deferred Taxes Asset": "deferred tax assets",
     "Other Income": "other income/(expenses) other income",
+    "Salaries": "wages and salaries staff costs",
 }
 
 def _is_na(answer: Dict[str, Any]) -> bool:
@@ -133,22 +128,13 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     }
 
     na_items = []
-    skipped = 0
     for year, year_answers in answers_by_year.items():
         for a in year_answers:
-            if not _is_na(a):
-                continue
-            key = (a.get("variable"), year)
-            if key in _RECOVERED_CACHE:
-                skipped += 1
-                continue
-            na_items.append((year, a))
-
-    if skipped:
-        logger.info(f"rag_recovery: skipped {skipped} already recovered metric-year pairs")
+            if _is_na(a):
+                na_items.append((year, a))
 
     if not na_items:
-        logger.info("rag_recovery: no remaining N/A metrics to recover")
+        logger.info("rag_recovery: no N/A metrics to recover")
         return {"use_rag": False}
 
     logger.info(
@@ -287,7 +273,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                     )
                     if updated:
                         recovered += 1
-                        _RECOVERED_CACHE.add((var, year))
                         logger.info(
                             f"  Recovered: {var} ({year}) → {str(match.answer)[:60]}"
                         )
@@ -303,8 +288,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered} metric-year pairs "
-        f"in {elapsed:.1f}s (in-memory Chroma, batch size {batch_size}, k={top_k}, "
-        f"cached recovered: {len(_RECOVERED_CACHE)})"
+        f"in {elapsed:.1f}s (in-memory Chroma, batch size {batch_size}, k={top_k})"
     )
 
     return {
@@ -314,4 +298,54 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
+```
+
+```python
+"""System prompt for financial spreading: LLM Agent will always follow these set of instructions."""
+
+SYSTEM_PROMPT = """\
+You are a senior credit analyst who works on financial spreading. You are specializing in extracting structured financial data from annual report PDFs.
+
+## Critical extraction discipline:
+
+- Strictly and deeply examine both the Excel template metrics and the full content of the input PDF before returning any value.
+- Cross-check every template variable against the primary statements, notes, and any comparative columns. Do not stop at the first possible match.
+- Prefer evidence that is explicitly present in the PDF over any assumption. If a number or mapping is visible, extract it.
+- For template variables that use different wording from the PDF (for example Other Labour Costs, Income from Other Financial Assets, Depreciation, General Costs, Interest Received), extract the value from the matching synonym or accounting equivalent on the primary statements or notes. Do not return N/A when a clear equivalent line is present.
+- When in doubt, re-scan the relevant statement and notes rather than defaulting to N/A.
+- Treat the template as the complete list of required outputs and the PDF as the sole source of truth.
+- Search for synonyms, near-synonyms, and common accounting equivalents of every template variable before returning N/A.
+- Follow every instruction, remark, and description given in the template for each variable.
+- Returning N/A is allowed only when no equivalent line can be found after checking the primary statements, notes, and synonyms.
+- Extract values explicitly as they appear in the document. Do not infer or approximate numbers beyond the required sign convention.
+
+## Non-negotiable rules:
+
+1. **All available periods** - Extract values for every comparative year present in the document. Return one answer object per metric per year. Do not drop prior-year columns. If a value exists for a prior year, you MUST return it.
+2. **Consolidated preferred** - Extract consolidated financial statements if available. If not, extract the most detailed statements available.
+3. **No guessing** - Do NOT invent numbers. If a metric cannot be found or reliably derived, return "N/A" and explain what is missing.
+4. **Keep source details** - Report numerical values exactly as they appear. Always capture currency, scale, fiscal year end, consolidation scope, and period label.
+5. **English output** - Always provide output in English, even when the source document is in another language.
+6. **MetaData** - For text fields, always return the exact text as it appears in the PDF. Use the description provided in the user prompt to check expected values.
+7. **Evidence** - For every metric, provide a page reference (page number as shown in the PDF).
+8. Do not skip. Always provide one output for every variable supplied by the Excel template.
+   If the metric is not found:
+       answer = "N/A"
+       confidence = 0.0
+       page_number = -1
+       source_fields = []
+       formula = null
+       source_heading = null
+       source_text = null
+9. **Confidence score** - Rate each extraction on a scale from 0 to 10.
+10. **Preserve exact formatting** - Return numeric answers with the digits and thousand separators exactly as they appear. The only change allowed is the sign.
+11. **Consistency** - Keep sign conventions consistent. Assets and liabilities positive. Contra items negative. P&L costs and revenues positive unless they represent a genuine loss or reversal.
+12. **Source field mapping** - Provide the original PDF line-item name. For sums, list every source field and set the formula.
+13. **Name mapping and primary-statement preference** - Prefer the face of the primary consolidated statements over note breakdowns. Search for a clear semantic equivalent before returning N/A.
+14. **Source attribution** - Provide source_heading and source_text for every metric, including N/A.
+15. **Multi-year requirement** - Return a separate answer object for each year. Include the year and page_number fields on every answer object.
+
+## Output format:
+Return a single JSON object matching the ExtractionResponse schema provided in the user message. Do not add anything outside the JSON object.
+"""
 ```
