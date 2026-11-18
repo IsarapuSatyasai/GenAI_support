@@ -94,6 +94,7 @@ def _update_answer_for_year(
     confidence: float,
     source_fields: list,
     source_text: str,
+    page_number: Any = -1,
 ) -> bool:
     year_list = answers_by_year.get(year)
     if not year_list:
@@ -105,6 +106,7 @@ def _update_answer_for_year(
             item["source_fields"] = source_fields
             item["source_text"] = source_text[:500]
             item["source_link"] = "RAG"
+            item["page_number"] = page_number
             return True
     return False
 
@@ -216,6 +218,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             "Strictly follow the template instructions, remarks, and descriptions. "
             "Search for synonyms and accounting equivalents of each variable before returning N/A. "
             "If an equivalent line exists on the primary statements or notes, extract it for every year shown. "
+            "Include the page number where the value was found. "
             "Do not omit any year."
         )
 
@@ -265,6 +268,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                         match.confidence or 0.65,
                         match.source_fields or [],
                         match.source_text or "",
+                        getattr(match, "page_number", -1),
                     )
                     if updated:
                         recovered += 1
@@ -293,4 +297,5 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
+
 ```
