@@ -47,17 +47,6 @@ SYNONYM_MAP = {
     "Account Payable Trade": "trade and other payables trade payables",
     "Deferred Taxes Asset": "deferred tax assets",
     "Other Income": "other income/(expenses) other income",
-    "Salaries": "wages and salaries staff costs",
-    "Cost of Goods Sold 1": "costs of goods sold cost of sales",
-    "Net Sales 1": "non-interest revenue net revenue revenue",
-    "GROSS INCOME": "net non-interest revenue gross profit",
-    "EBIT": "income before net finance income and income taxes operating profit",
-    "EBT": "income before income taxes profit before tax",
-    "NET INCOME": "net income for the year profit for the year",
-    "Cash and Bank": "cash and cash equivalents",
-    "Inventories": "inventories inventory",
-    "Goodwill": "goodwill",
-    "Investments": "other financial assets at FVPL financial assets",
 }
 
 def _is_na(answer: Dict[str, Any]) -> bool:
