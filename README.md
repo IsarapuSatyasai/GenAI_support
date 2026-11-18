@@ -6,9 +6,12 @@ by the upstream selection step. For every metric that is still missing,
 it retrieves the most relevant chunks and asks the model to fill the
 value for each year present in the document. The index is discarded
 when the node finishes.
+
+Successfully recovered metric-year pairs are remembered for the life
+of the process so later runs can skip them and concentrate on the rest.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import logging
 import time
 import os
@@ -29,18 +32,32 @@ from models import MultiYearExtractionResponse
 
 logger = logging.getLogger(__name__)
 
+# Process-level cache of metric-year pairs that were already recovered
+_RECOVERED_CACHE: Set[Tuple[str, Any]] = set()
+
 SYNONYM_MAP = {
-    "Depreciation": "amortization depreciation amortisation",
-    "Amortisation": "amortization intangible assets",
-    "Other Labour Costs": "social securities pension staff labour costs employee benefits",
-    "Interest Received - cash": "interest income interest received",
+    "Depreciation": "amortization and depreciation depreciation and amortisation depreciation",
+    "Amortisation": "amortization intangible assets amortisation",
+    "Other Labour Costs": "social securities and pension costs staff costs total labour costs employee benefit expense wages",
+    "Interest Received - cash": "interest income interest received interest income received",
     "General Costs": "other operating expenses administrative expenses other expenses",
-    "Income from Other Finan Assets - cash": "finance income finance income received",
+    "Income from Other Finan Assets - cash": "finance income finance income received income from other financial assets",
     "3rd Party Svc's (Sub-Contr Work)": "costs incurred from financial institutions",
-    "Accounts Receivable Trade": "trade and other receivables",
-    "Account Payable Trade": "trade and other payables",
+    "Accounts Receivable Trade": "trade and other receivables receivables from customers",
+    "Account Payable Trade": "trade and other payables trade payables",
     "Deferred Taxes Asset": "deferred tax assets",
-    "Other Income": "other income expenses",
+    "Other Income": "other income/(expenses) other income",
+    "Salaries": "wages and salaries staff costs",
+    "Cost of Goods Sold 1": "costs of goods sold cost of sales",
+    "Net Sales 1": "non-interest revenue net revenue revenue",
+    "GROSS INCOME": "net non-interest revenue gross profit",
+    "EBIT": "income before net finance income and income taxes operating profit",
+    "EBT": "income before income taxes profit before tax",
+    "NET INCOME": "net income for the year profit for the year",
+    "Cash and Bank": "cash and cash equivalents",
+    "Inventories": "inventories inventory",
+    "Goodwill": "goodwill",
+    "Investments": "other financial assets at FVPL financial assets",
 }
 
 def _is_na(answer: Dict[str, Any]) -> bool:
@@ -127,13 +144,22 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     }
 
     na_items = []
+    skipped = 0
     for year, year_answers in answers_by_year.items():
         for a in year_answers:
-            if _is_na(a):
-                na_items.append((year, a))
+            if not _is_na(a):
+                continue
+            key = (a.get("variable"), year)
+            if key in _RECOVERED_CACHE:
+                skipped += 1
+                continue
+            na_items.append((year, a))
+
+    if skipped:
+        logger.info(f"rag_recovery: skipped {skipped} already recovered metric-year pairs")
 
     if not na_items:
-        logger.info("rag_recovery: no N/A metrics to recover")
+        logger.info("rag_recovery: no remaining N/A metrics to recover")
         return {"use_rag": False}
 
     logger.info(
@@ -272,6 +298,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                     )
                     if updated:
                         recovered += 1
+                        _RECOVERED_CACHE.add((var, year))
                         logger.info(
                             f"  Recovered: {var} ({year}) → {str(match.answer)[:60]}"
                         )
@@ -287,7 +314,8 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered} metric-year pairs "
-        f"in {elapsed:.1f}s (in-memory Chroma, batch size {batch_size}, k={top_k})"
+        f"in {elapsed:.1f}s (in-memory Chroma, batch size {batch_size}, k={top_k}, "
+        f"cached recovered: {len(_RECOVERED_CACHE)})"
     )
 
     return {
@@ -297,5 +325,4 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
-
 ```
