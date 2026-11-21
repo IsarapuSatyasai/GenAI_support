@@ -1,4 +1,117 @@
 ```python
+"""
+Configration of paths and setup of environment variables for financial spreading project.
+Import this to main notebook to setup the openai and storage account.
+"""
+
+import os
+from databricks.sdk.runtime import dbutils, spark
+
+class Settings:
+    # os.environ["AZURE_OPENAI_API_KEY"] = dbutils.secrets.get(
+    #     scope="azure-key-vault-scope", key="openai-apim-api-key"
+    #     )
+    os.environ["AZURE_OPENAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
+
+    # access to storage account has changed to this method os.environ["STORAGE_ACCOUNT"] = "mscsta{ci_code}{env}".format(ci_code=os.environ["CI_CODE"], env=os.environ["ENVIRONMENT"])
+    os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
+    
+    os.environ["ENVIRONMENT"] = "prd"
+
+    STORAGE_ACCOUNT_NAME = "mscstagailtuprd03"
+    FOLDER_NAME = "projects"
+    TENANT_ID = "07751f8b-9617-49d5-9024-85f034f400ec"
+    DBR_MI = "fa515616-7575-408d-8196-320484b017c7"
+
+    storage_host = f"{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net"
+
+
+    spark.conf.set(f"fs.azure.account.auth.type.{storage_host}", "OAuth")
+    spark.conf.set(
+        f"fs.azure.account.oauth.provider.type.{storage_host}",
+        "org.apache.hadoop.fs.azurebfs.oauth2.MsiTokenProvider",
+    )
+    spark.conf.set(
+        f"fs.azure.account.oauth2.msi.tenant.{storage_host}",
+        TENANT_ID,
+    )
+    spark.conf.set(
+        f"fs.azure.account.oauth2.client.id.{storage_host}",
+        DBR_MI,
+    )
+    # See below an example how to access the storage account directly
+    subfolder = 'FinancialSpreading'
+    # # List files directly — no mount required
+    path = f"abfss://{FOLDER_NAME}@{storage_host}/{subfolder}"
+    # dbutils.fs.ls(path)
+
+
+    # --- Azure OpenAI ---
+    openai_api_key: str = ""
+    azure_openai_deployment: str = "gpt-5.6-luna"
+    azure_openai_api_version: str = "2024-10-21"
+
+    # --- LLM parameters ---
+    llm_temperature: float = 0.0
+    llm_top_p: float = 1.0
+    llm_seed: int = 1234
+
+    # --- RAG settings ---
+    rag_llm_model: str = "gpt-5.2"
+    rag_embedding_model: str = "text-embedding-3-large"
+    rag_sentence_window_size: int = 5
+    rag_similarity_top_k: int = 20
+    rag_rerank_top_n: int = 10
+    rag_rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-2-v2"
+    rag_rerank_enabled: bool = True
+    rag_source_key: str = "pdf_source"
+    rag_pdf_loader_type: str = "PyMuPDFLoader"
+    rag_remove_duplicate_chunks: bool = True
+    rag_chunk_size: int = 1500
+    rag_chunk_overlap: int = 150
+    rag_batch_size: int = 3
+    rag_page_char_limit: int = 2500
+
+    # --- Page selection ---
+    first_n_pages = 5
+    page_score_threshold = 1
+    min_pages = 30
+    max_selected_pages = 10
+    max_adjacent_pages = 2
+    refinement_attempts = 0
+
+    # first_n_pages = 75
+    # page_score_threshold = 1
+    # min_pages = 30
+    # max_selected_pages = 10
+    # max_adjacent_pages = 2
+    # refinement_attempts = 0
+
+
+    # --- Sharepoint ---
+    sharepoint_link = "https://connect2dll.sharepoint.com/:b:/r/sites/Grp-FinancialSpreading/Shared%20Documents/General/5.%20Input%20data"
+
+    paths = [
+        {
+            'name': 'input_path',
+            'type': 'Azure blob storage',
+            'reference': '/mnt/projects/FinancialSpreading/InputData',
+            'comment': 'Input location for storing annual reports for each country'
+        },
+        {
+            'name': 'output_path',
+            'type': 'Azure blob storage',
+            # 'reference': '/mnt/projects/FinancialSpreading/OutputData', #Old way of writing
+            'reference': f"abfss://{FOLDER_NAME}@{storage_host}/{subfolder}/OutputData",
+            'comment': 'Output location for storing annual reports for each country'
+        },   
+    ]
+                                                         
+def get_settings() -> Settings:
+    return Settings()
+```
+
+```python
 """Node: RAG recovery for N/A metrics.
 
 Builds a temporary in-memory Chroma index from the pages already chosen
@@ -18,7 +131,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
-from sentence_transformers import CrossEncoder   # already used in Credit RAG
+from sentence_transformers import CrossEncoder
 
 from custom_lcel_components.llm import create_llm
 from graph.graph_state import FinancialGraphState
@@ -143,7 +256,9 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     if not selected_pages:
         return {"errors": errors + ["rag_recovery skipped: no selected_pages"]}
 
-    metric_lookup = {(m.get("worksheet"), m.get("variable")): m for m in excel_data}
+    metric_lookup = {
+        (m.get("worksheet"), m.get("variable")): m for m in excel_data
+    }
 
     na_items = []
     for year, year_answers in answers_by_year.items():
@@ -190,7 +305,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         return {"errors": errors + [f"Failed to build index: {exc}"]}
 
     llm = create_llm(
-        azure_deployment=settings.azure_openai_deployment,
+        azure_deployment=settings.rag_llm_model,
         top_p=settings.llm_top_p,
     )
     structured_llm = (
@@ -215,8 +330,12 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         query_parts = []
         for var in batch_vars:
             sample = by_var[var][0][1]
-            desc = metric_lookup.get((sample.get("worksheet"), var), {}).get("description") or ""
-            remarks = metric_lookup.get((sample.get("worksheet"), var), {}).get("remarks") or ""
+            desc = metric_lookup.get(
+                (sample.get("worksheet"), var), {}
+            ).get("description") or ""
+            remarks = metric_lookup.get(
+                (sample.get("worksheet"), var), {}
+            ).get("remarks") or ""
             user_metrics.append({
                 "worksheet": sample.get("worksheet"),
                 "variable": var,
@@ -305,159 +424,4 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
-```
-
-```python
-"""Specialised prompts for the RAG recovery node."""
-
-RAG_RECOVERY_SYSTEM_PROMPT = """\
-You are a senior credit analyst performing financial spreading recovery.
-
-Your only job is to extract the missing (N/A) metrics supplied in the user message
-from the provided document context. The context consists of the most relevant
-chunks already retrieved from the selected pages of the annual report.
-
-Critical rules:
-- Search for synonyms, near-synonyms and common accounting equivalents before returning N/A.
-- Prefer the face of the primary consolidated statements over note breakdowns.
-- Extract every requested year. Do not drop prior-year columns.
-- Return numeric values exactly as they appear (including thousand separators). Apply the sign convention only.
-- Provide the page number shown in the [Page N] markers.
-- If a clear equivalent line exists, extract it. Return N/A only when nothing can be found after a thorough check.
-- Do not invent numbers.
-
-Output must strictly follow the MultiYearExtractionResponse schema.
-"""
-
-def build_rag_recovery_user_prompt(
-    user_prompt: str,
-    years: list,
-    context: str,
-) -> str:
-    year_instruction = (
-        f"You MUST return one answer object for EVERY year in this list: {years}. "
-        "Strictly follow the template instructions, remarks, and descriptions. "
-        "Search for synonyms and accounting equivalents of each variable before returning N/A. "
-        "If an equivalent line exists on the primary statements or notes, extract it for every year shown. "
-        "Include the page number where the value was found. "
-        "Do not omit any year."
-    )
-    return (
-        f"Please extract only the following missing variables:\n"
-        f"{user_prompt}\n\n"
-        f"{year_instruction}\n\n"
-        f"Document context:\n{context}"
-    )
-```
-
-```python
-"""
-Configration of paths and setup of environment variables for financial spreading project.
-Import this to main notebook to setup the openai and storage account.
-"""
-
-import os
-from databricks.sdk.runtime import dbutils, spark
-
-class Settings:
-    # os.environ["AZURE_OPENAI_API_KEY"] = dbutils.secrets.get(
-    #     scope="azure-key-vault-scope", key="openai-apim-api-key"
-    #     )
-    os.environ["AZURE_OPENAI_ENDPOINT"] = "https://msc-apim-gailtu-prd.azure-api.net/openai-api"
-
-    # access to storage account has changed to this method os.environ["STORAGE_ACCOUNT"] = "mscsta{ci_code}{env}".format(ci_code=os.environ["CI_CODE"], env=os.environ["ENVIRONMENT"])
-    os.environ["STORAGE_ACCOUNT"] = "mscstagailtuprd03"
-    
-    os.environ["ENVIRONMENT"] = "prd"
-
-    STORAGE_ACCOUNT_NAME = "mscstagailtuprd03"
-    FOLDER_NAME = "projects"
-    TENANT_ID = "07751f8b-9617-49d5-9024-85f034f400ec"
-    DBR_MI = "fa515616-7575-408d-8196-320484b017c7"
-
-    storage_host = f"{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net"
-
-
-    spark.conf.set(f"fs.azure.account.auth.type.{storage_host}", "OAuth")
-    spark.conf.set(
-        f"fs.azure.account.oauth.provider.type.{storage_host}",
-        "org.apache.hadoop.fs.azurebfs.oauth2.MsiTokenProvider",
-    )
-    spark.conf.set(
-        f"fs.azure.account.oauth2.msi.tenant.{storage_host}",
-        TENANT_ID,
-    )
-    spark.conf.set(
-        f"fs.azure.account.oauth2.client.id.{storage_host}",
-        DBR_MI,
-    )
-    # See below an example how to access the storage account directly
-    subfolder = 'FinancialSpreading'
-    # # List files directly — no mount required
-    path = f"abfss://{FOLDER_NAME}@{storage_host}/{subfolder}"
-    # dbutils.fs.ls(path)
-
-
-    # --- Azure OpenAI ---
-    openai_api_key: str = ""
-    azure_openai_deployment: str = "gpt-5.6-luna"
-    azure_openai_api_version: str = "2024-10-21"
-
-    # --- LLM parameters ---
-    llm_temperature: float = 0.0
-    llm_top_p: float = 1.0
-    llm_seed: int = 1234
-
-    # --- RAG settings ---
-    rag_embedding_model: str = "text-embedding-3-large"
-    rag_sentence_window_size: int = 5
-    rag_similarity_top_k: int = 20
-    rag_rerank_top_n: int = 10
-    rag_rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-2-v2"
-    rag_rerank_enabled: bool = True
-    rag_source_key: str = "pdf_source"
-    rag_pdf_loader_type: str = "PyMuPDFLoader"
-    rag_remove_duplicate_chunks: bool = True
-    rag_chunk_size: int = 1500
-    rag_chunk_overlap: int = 150
-    rag_batch_size: int = 3
-    rag_page_char_limit: int = 2500
-
-    # --- Page selection ---
-    first_n_pages = 5
-    page_score_threshold = 1
-    min_pages = 30
-    max_selected_pages = 10
-    max_adjacent_pages = 2
-    refinement_attempts = 0
-
-    # first_n_pages = 75
-    # page_score_threshold = 1
-    # min_pages = 30
-    # max_selected_pages = 10
-    # max_adjacent_pages = 2
-    # refinement_attempts = 0
-
-
-    # --- Sharepoint ---
-    sharepoint_link = "https://connect2dll.sharepoint.com/:b:/r/sites/Grp-FinancialSpreading/Shared%20Documents/General/5.%20Input%20data"
-
-    paths = [
-        {
-            'name': 'input_path',
-            'type': 'Azure blob storage',
-            'reference': '/mnt/projects/FinancialSpreading/InputData',
-            'comment': 'Input location for storing annual reports for each country'
-        },
-        {
-            'name': 'output_path',
-            'type': 'Azure blob storage',
-            # 'reference': '/mnt/projects/FinancialSpreading/OutputData', #Old way of writing
-            'reference': f"abfss://{FOLDER_NAME}@{storage_host}/{subfolder}/OutputData",
-            'comment': 'Output location for storing annual reports for each country'
-        },   
-    ]
-                                                         
-def get_settings() -> Settings:
-    return Settings()
 ```
