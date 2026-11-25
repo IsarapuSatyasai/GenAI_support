@@ -1,4 +1,111 @@
 ```python
+"""Node: RAG recovery for N/A metrics.
+
+Builds a temporary in-memory Chroma index from the pages already chosen
+by the upstream selection step. For every metric that is still missing,
+it retrieves the most relevant chunks (optionally reranked) and asks the
+model to fill the value for each year present in the document.
+"""
+
+from typing import Any, Dict, List, Optional
+import logging
+import time
+import os
+from collections import defaultdict
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.documents import Document
+from sentence_transformers import CrossEncoder
+
+from custom_lcel_components.llm import create_llm
+from graph.graph_state import FinancialGraphState
+from config import get_settings
+from prompts.user_prompt import get_user_prompt
+from prompts.rag_recovery_prompt import (
+    RAG_RECOVERY_SYSTEM_PROMPT,
+    build_rag_recovery_user_prompt,
+)
+from models import MultiYearExtractionResponse
+
+logger = logging.getLogger(__name__)
+
+SYNONYM_MAP = {
+    "Depreciation": "amortization and depreciation depreciation and amortisation depreciation",
+    "Amortisation": "amortization intangible assets amortisation",
+    "Other Labour Costs": "social securities and pension costs staff costs total labour costs employee benefit expense wages",
+    "Interest Received - cash": "interest income interest received interest income received",
+    "General Costs": "other operating expenses administrative expenses other expenses",
+    "Income from Other Finan Assets - cash": "finance income finance income received income from other financial assets",
+    "3rd Party Svc's (Sub-Contr Work)": "costs incurred from financial institutions",
+    "Accounts Receivable Trade": "trade and other receivables receivables from customers",
+    "Account Payable Trade": "trade and other payables trade payables",
+    "Deferred Taxes Asset": "deferred tax assets",
+    "Other Income": "other income/(expenses) other income",
+    "Salaries": "wages and salaries staff costs",
+}
+
+
+def _is_na(answer: Dict[str, Any]) -> bool:
+    val = str(answer.get("answer", "")).strip().upper()
+    try:
+        conf = float(answer.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return val in ("N/A", "NA", "", "NONE") or conf == 0.0
+
+
+def _build_inmemory_index(
+    selected_pages: List[Dict[str, Any]],
+    embedding_model: AzureOpenAIEmbeddings,
+    chunk_size: int,
+    chunk_overlap: int,
+    page_char_limit: int,
+) -> Optional[Chroma]:
+    docs = []
+    recursive_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    for page in selected_pages:
+        text = page.get("text") or page.get("content") or ""
+        if not text.strip():
+            continue
+        page_no = page.get("page_number") or page.get("page") or -1
+        meta = {"page_number": page_no}
+
+        if len(text) <= page_char_limit:
+            docs.append(Document(page_content=text, metadata=meta))
+        else:
+            splits = recursive_splitter.create_documents([text], metadatas=[meta])
+            docs.extend(splits)
+
+    if not docs:
+        logger.warning("rag_recovery: no text found in selected_pages")
+        return None
+
+    logger.info(f"Building in-memory Chroma index from {len(docs)} chunks")
+    return Chroma.from_documents(docs, embedding_model)
+
+
+def _rerank(docs: List[Document], query: str, model_name: str, top_n: int) -> List[Document]:
+    if not docs:
+        return docs
+    try:
+        model = CrossEncoder(model_name)
+        pairs = [(query, d.page_content) for d in docs]
+        scores = model.predict(pairs)
+        scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        return [d for d, _ in scored[:top_n]]
+    except Exception as exc:
+        logger.warning(f"Reranking failed, falling back to original order: {exc}")
+        return docs[:top_n]
+
+
 def _update_answer_for_year(
     answers_by_year: Dict[Any, List[Dict[str, Any]]],
     variable: str,
@@ -208,4 +315,116 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
+```
+
+```python
+def create_excel_output(state: FinancialGraphState):
+    excel_data = state.get("excel_data", [])
+    answers = state.get("answers", [])
+    output_path = state.get("output_path", "")
+    pdf_file_name = state.get("pdf_file_name", "")
+    errors = list(state.get("errors", []))
+
+    if not excel_data:
+        return {
+            "output_excel": "",
+            "comparison_excel": "",
+            "errors": errors + ["No template metrics available for Excel output."],
+        }
+
+    output_name = (
+        pdf_file_name.removeprefix("InputData").removesuffix(".pdf") + ".xlsx"
+    )
+    output_excel = output_path.rstrip("/") + "/" + output_name
+
+    comparison_name = (
+        pdf_file_name.removeprefix("InputData").removesuffix(".pdf")
+        + "-page-selection.xlsx"
+    )
+    comparison_excel = output_path.rstrip("/") + "/" + comparison_name
+
+    years = sorted(
+        [y for y in state.get("years", []) if y is not None],
+        reverse=True,
+    )
+    answers_by_year = state.get("answers_by_year", {})
+
+    if not years and answers:
+        years = [None]
+
+    worksheet_dict = {}
+
+    for metric in excel_data:
+        worksheet = metric["worksheet"]
+        variable = metric["variable"]
+
+        row = {"variable": variable}
+
+        for year in years:
+            year_answers = answers_by_year.get(year, [])
+            match = next(
+                (a for a in year_answers if a.get("variable") == variable),
+                {},
+            )
+            prefix = f"{year}_" if year is not None else ""
+
+            row[f"{prefix}answer"] = match.get("answer", "N/A")
+            row[f"{prefix}confidence"] = match.get("confidence", 0.0)
+            row[f"{prefix}page_number"] = match.get("page_number", -1)
+            row[f"{prefix}source_fields"] = _safe_source_fields(match.get("source_fields"))
+            row[f"{prefix}formula"] = _safe_text(match.get("formula"))
+            row[f"{prefix}source_link"] = _safe_text(match.get("source_link") or "N/A")
+            row[f"{prefix}RAG_extracted"] = match.get("rag_extracted", "No")
+            row[f"{prefix}rag_chunk"] = _safe_text(match.get("rag_chunk"))
+
+        worksheet_dict.setdefault(worksheet, []).append(row)
+
+    worksheet_dict = {
+        worksheet: pd.DataFrame(rows)
+        for worksheet, rows in worksheet_dict.items()
+    }
+
+    selected_numbers = {p.get("page_number") for p in state.get("selected_pages", [])}
+    page_rows = []
+    for page in state.get("pdf_pages", []):
+        page_number = page.get("page_number")
+        page_rows.append({
+            "Page Number": page_number,
+            "Selected": "Selected" if page_number in selected_numbers else "Not Selected",
+            "Exact Reason": page.get("selection_reason", "Selection evidence was not recorded."),
+        })
+    comparison_dict = {
+        "Page Selection": pd.DataFrame(page_rows, columns=["Page Number", "Selected", "Exact Reason"])
+    }
+
+    try:
+        print(f"Creating Excel output: {output_excel}")
+        print(f"Template metrics: {len(excel_data)}")
+        print(f"Years: {years}")
+        print(f"Worksheets: {list(worksheet_dict.keys())}")
+
+        status = excel_write(
+            dataframes=worksheet_dict,
+            output_path=output_excel,
+        )
+
+        comparison_status = excel_write(
+            dataframes=comparison_dict,
+            output_path=comparison_excel,
+        )
+
+        return {
+            "output_excel": status,
+            "comparison_excel": comparison_status,
+            "errors": errors,
+        }
+
+    except Exception as exc:
+        error = f"Error writing excel file: {exc}"
+        print(error)
+        return {
+            "output_excel": "",
+            "comparison_excel": "",
+            "errors": errors + [error],
+        }
 ```
