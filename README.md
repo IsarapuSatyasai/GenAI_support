@@ -34,21 +34,6 @@ logger = logging.getLogger(__name__)
 
 INCOME_STATEMENT_SHEET = "Income_Statement"
 
-SYNONYM_MAP = {
-    "Depreciation": "amortization and depreciation depreciation and amortisation depreciation",
-    "Amortisation": "amortization intangible assets amortisation",
-    "Other Labour Costs": "social securities and pension costs staff costs total labour costs employee benefit expense wages",
-    "Interest Received - cash": "interest income interest received interest income received",
-    "General Costs": "other operating expenses administrative expenses other expenses",
-    "Income from Other Finan Assets - cash": "finance income finance income received income from other financial assets",
-    "3rd Party Svc's (Sub-Contr Work)": "costs incurred from financial institutions",
-    "Accounts Receivable Trade": "trade and other receivables receivables from customers",
-    "Account Payable Trade": "trade and other payables trade payables",
-    "Deferred Taxes Asset": "deferred tax assets",
-    "Other Income": "other income/(expenses) other income",
-    "Salaries": "wages and salaries staff costs",
-}
-
 
 def _is_na(answer: Dict[str, Any]) -> bool:
     val = str(answer.get("answer", "")).strip().upper()
@@ -222,8 +207,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         ).get("remarks") or ""
 
         query_parts = [var]
-        if var in SYNONYM_MAP:
-            query_parts.append(SYNONYM_MAP[var])
         if desc:
             query_parts.append(desc)
         if remarks:
@@ -295,7 +278,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered} metric-year pairs "
-        f"in {elapsed:.1f}s (Income Statement only, per-metric retrieval, k={top_k}, rerank={do_rerank})"
+        f"in {elapsed:.1f}s (Income Statement only, per-metric, template-driven query, k={top_k}, rerank={do_rerank})"
     )
 
     return {
