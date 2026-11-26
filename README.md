@@ -32,6 +32,8 @@ from models import MultiYearExtractionResponse
 
 logger = logging.getLogger(__name__)
 
+INCOME_STATEMENT_SHEET = "Income_Statement"
+
 SYNONYM_MAP = {
     "Depreciation": "amortization and depreciation depreciation and amortisation depreciation",
     "Amortisation": "amortization intangible assets amortisation",
@@ -153,15 +155,15 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     na_items = []
     for year, year_answers in answers_by_year.items():
         for a in year_answers:
-            if _is_na(a):
+            if _is_na(a) and a.get("worksheet") == INCOME_STATEMENT_SHEET:
                 na_items.append((year, a))
 
     if not na_items:
-        logger.info("rag_recovery: no N/A metrics to recover")
+        logger.info("rag_recovery: no N/A Income Statement metrics to recover")
         return {"use_rag": False}
 
     logger.info(
-        f"rag_recovery: recovering {len(na_items)} N/A metric-year pairs "
+        f"rag_recovery: recovering {len(na_items)} N/A Income Statement metric-year pairs "
         f"from {len(selected_pages)} selected pages"
     )
 
@@ -169,7 +171,6 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     chunk_size = settings.rag_chunk_size
     chunk_overlap = settings.rag_chunk_overlap
     top_k = settings.rag_similarity_top_k
-    batch_size = settings.rag_batch_size
     page_char_limit = getattr(settings, "rag_page_char_limit", 2500)
     do_rerank = getattr(settings, "rag_rerank_enabled", True)
     rerank_top_n = settings.rag_rerank_top_n
@@ -211,42 +212,32 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     for year, item in na_items:
         by_var[item.get("variable")].append((year, item))
 
-    var_list = list(by_var.keys())
+    for var, year_items in by_var.items():
+        sample = year_items[0][1]
+        desc = metric_lookup.get(
+            (sample.get("worksheet"), var), {}
+        ).get("description") or ""
+        remarks = metric_lookup.get(
+            (sample.get("worksheet"), var), {}
+        ).get("remarks") or ""
 
-    for batch_idx, i in enumerate(range(0, len(var_list), batch_size)):
-        batch_vars = var_list[i : i + batch_size]
-
-        user_metrics = []
-        query_parts = []
-        for var in batch_vars:
-            sample = by_var[var][0][1]
-            desc = metric_lookup.get(
-                (sample.get("worksheet"), var), {}
-            ).get("description") or ""
-            remarks = metric_lookup.get(
-                (sample.get("worksheet"), var), {}
-            ).get("remarks") or ""
-            user_metrics.append({
-                "worksheet": sample.get("worksheet"),
-                "variable": var,
-                "description": desc,
-            })
-            query_parts.append(var)
-            if var in SYNONYM_MAP:
-                query_parts.append(SYNONYM_MAP[var])
-            if desc:
-                query_parts.append(desc)
-            if remarks:
-                query_parts.append(remarks)
-
-        user_prompt = get_user_prompt(user_metrics)
+        query_parts = [var]
+        if var in SYNONYM_MAP:
+            query_parts.append(SYNONYM_MAP[var])
+        if desc:
+            query_parts.append(desc)
+        if remarks:
+            query_parts.append(remarks)
         query = " ".join(query_parts)
 
-        logger.info(
-            f"rag_recovery: batch {batch_idx + 1}/"
-            f"{(len(var_list) + batch_size - 1) // batch_size} "
-            f"({len(batch_vars)} metrics)"
-        )
+        user_metrics = [{
+            "worksheet": sample.get("worksheet"),
+            "variable": var,
+            "description": desc,
+        }]
+        user_prompt = get_user_prompt(user_metrics)
+
+        logger.info(f"rag_recovery: retrieving for metric '{var}'")
 
         try:
             docs = retriever.invoke(query)
@@ -268,9 +259,9 @@ def rag_recovery(state: FinancialGraphState) -> dict:
             response: MultiYearExtractionResponse = structured_llm.invoke(messages)
 
             for match in response.answers:
-                var = match.variable
+                match_var = match.variable
                 year = getattr(match, "year", None)
-                if not var or year is None:
+                if not match_var or year is None:
                     continue
                 if (
                     match.answer
@@ -278,7 +269,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                 ):
                     updated = _update_answer_for_year(
                         answers_by_year,
-                        var,
+                        match_var,
                         year,
                         str(match.answer).strip(),
                         match.confidence or 0.65,
@@ -290,12 +281,12 @@ def rag_recovery(state: FinancialGraphState) -> dict:
                     if updated:
                         recovered += 1
                         logger.info(
-                            f"  Recovered: {var} ({year}) → {str(match.answer)[:60]}"
+                            f"  Recovered: {match_var} ({year}) → {str(match.answer)[:60]}"
                         )
 
         except Exception as exc:
-            logger.warning(f"Batch {batch_idx + 1} failed: {exc}")
-            errors.append(f"rag_recovery batch {batch_idx + 1} error: {exc}")
+            logger.warning(f"Metric '{var}' failed: {exc}")
+            errors.append(f"rag_recovery metric '{var}' error: {exc}")
 
     latest = years[0] if years else None
     if latest is not None and latest in answers_by_year:
@@ -304,8 +295,7 @@ def rag_recovery(state: FinancialGraphState) -> dict:
     elapsed = time.time() - start_time
     logger.info(
         f"rag_recovery finished: recovered {recovered} metric-year pairs "
-        f"in {elapsed:.1f}s (in-memory Chroma, batch size {batch_size}, "
-        f"k={top_k}, rerank={do_rerank})"
+        f"in {elapsed:.1f}s (Income Statement only, per-metric retrieval, k={top_k}, rerank={do_rerank})"
     )
 
     return {
@@ -315,116 +305,4 @@ def rag_recovery(state: FinancialGraphState) -> dict:
         "use_rag": True,
         "rag_collection_name": "in-memory-chroma",
     }
-```
-
-```python
-def create_excel_output(state: FinancialGraphState):
-    excel_data = state.get("excel_data", [])
-    answers = state.get("answers", [])
-    output_path = state.get("output_path", "")
-    pdf_file_name = state.get("pdf_file_name", "")
-    errors = list(state.get("errors", []))
-
-    if not excel_data:
-        return {
-            "output_excel": "",
-            "comparison_excel": "",
-            "errors": errors + ["No template metrics available for Excel output."],
-        }
-
-    output_name = (
-        pdf_file_name.removeprefix("InputData").removesuffix(".pdf") + ".xlsx"
-    )
-    output_excel = output_path.rstrip("/") + "/" + output_name
-
-    comparison_name = (
-        pdf_file_name.removeprefix("InputData").removesuffix(".pdf")
-        + "-page-selection.xlsx"
-    )
-    comparison_excel = output_path.rstrip("/") + "/" + comparison_name
-
-    years = sorted(
-        [y for y in state.get("years", []) if y is not None],
-        reverse=True,
-    )
-    answers_by_year = state.get("answers_by_year", {})
-
-    if not years and answers:
-        years = [None]
-
-    worksheet_dict = {}
-
-    for metric in excel_data:
-        worksheet = metric["worksheet"]
-        variable = metric["variable"]
-
-        row = {"variable": variable}
-
-        for year in years:
-            year_answers = answers_by_year.get(year, [])
-            match = next(
-                (a for a in year_answers if a.get("variable") == variable),
-                {},
-            )
-            prefix = f"{year}_" if year is not None else ""
-
-            row[f"{prefix}answer"] = match.get("answer", "N/A")
-            row[f"{prefix}confidence"] = match.get("confidence", 0.0)
-            row[f"{prefix}page_number"] = match.get("page_number", -1)
-            row[f"{prefix}source_fields"] = _safe_source_fields(match.get("source_fields"))
-            row[f"{prefix}formula"] = _safe_text(match.get("formula"))
-            row[f"{prefix}source_link"] = _safe_text(match.get("source_link") or "N/A")
-            row[f"{prefix}RAG_extracted"] = match.get("rag_extracted", "No")
-            row[f"{prefix}rag_chunk"] = _safe_text(match.get("rag_chunk"))
-
-        worksheet_dict.setdefault(worksheet, []).append(row)
-
-    worksheet_dict = {
-        worksheet: pd.DataFrame(rows)
-        for worksheet, rows in worksheet_dict.items()
-    }
-
-    selected_numbers = {p.get("page_number") for p in state.get("selected_pages", [])}
-    page_rows = []
-    for page in state.get("pdf_pages", []):
-        page_number = page.get("page_number")
-        page_rows.append({
-            "Page Number": page_number,
-            "Selected": "Selected" if page_number in selected_numbers else "Not Selected",
-            "Exact Reason": page.get("selection_reason", "Selection evidence was not recorded."),
-        })
-    comparison_dict = {
-        "Page Selection": pd.DataFrame(page_rows, columns=["Page Number", "Selected", "Exact Reason"])
-    }
-
-    try:
-        print(f"Creating Excel output: {output_excel}")
-        print(f"Template metrics: {len(excel_data)}")
-        print(f"Years: {years}")
-        print(f"Worksheets: {list(worksheet_dict.keys())}")
-
-        status = excel_write(
-            dataframes=worksheet_dict,
-            output_path=output_excel,
-        )
-
-        comparison_status = excel_write(
-            dataframes=comparison_dict,
-            output_path=comparison_excel,
-        )
-
-        return {
-            "output_excel": status,
-            "comparison_excel": comparison_status,
-            "errors": errors,
-        }
-
-    except Exception as exc:
-        error = f"Error writing excel file: {exc}"
-        print(error)
-        return {
-            "output_excel": "",
-            "comparison_excel": "",
-            "errors": errors + [error],
-        }
 ```
